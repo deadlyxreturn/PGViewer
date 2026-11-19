@@ -1969,6 +1969,15 @@ fn paint_title_button(ui: &egui::Ui, p: &Palette, icon: &str, resp: &egui::Respo
         }
         let rim = if hot { p.amber.lerp_to_gamma(p.ink, 0.35) } else { p.amber.gamma_multiply(0.74) };
         ui.painter().rect_stroke(face, 7, border_stroke(p, Stroke::new(1.0, rim)), egui::StrokeKind::Inside);
+        // PG Viewer: the skin's own neon close, minimize and maximize icons
+        let skin_icon = match icon {
+            "x" => "icons/pg-close",
+            "minus" => "icons/pg-minimize",
+            _ => "icons/pg-maximize",
+        };
+        if !p.high_contrast && super::dragon_art::paint(ui.painter(), skin_icon, face.shrink(if hot { 2.0 } else { 3.0 }), Color32::WHITE) {
+            return;
+        }
         let stroke = Stroke::new(if hot { 2.0 } else { 1.7 }, p.ink);
         let painter = ui.painter();
         match icon {

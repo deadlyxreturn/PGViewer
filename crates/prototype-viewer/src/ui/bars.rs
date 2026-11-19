@@ -3157,9 +3157,34 @@ fn tool_button(
             icon_rect = Some(egui::Rect::from_center_size(rect.center(), Vec2::splat(look.icon)));
         }
     }
+    // PG Viewer: the skin's own labelled button for this command
+    // (`toolbar/<command>.png`: face, heart and word in one picture), when
+    // the button is wide enough to show its word
+    let whole = (skinned && text.is_some())
+        .then(|| super::dragon_art::texture(ui.ctx(), &format!("toolbar/{command}")))
+        .flatten();
+    if let Some(t) = &whole {
+        let shade = if !ready || locked {
+            Color32::from_white_alpha(115)
+        } else if hovered || active {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(232)
+        };
+        let face = rect.shrink2(Vec2::new(1.0, 1.0));
+        painter.image(t.id(), face, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), shade);
+        if ready && (active || hovered) {
+            let glow = if active { Color32::from_rgba_unmultiplied(255, 90, 200, 150) } else { Color32::from_rgba_unmultiplied(150, 220, 255, 110) };
+            painter.rect_stroke(face.expand(1.0), face.height() * 0.3, egui::Stroke::new(1.6, glow), egui::StrokeKind::Outside);
+        }
+        text = None;
+        icon_rect = None;
+    }
     // the gold icon, full colour (dimmed when the command cannot run)
     let gold = (!p.high_contrast).then(|| moon_tool_icon(command)).flatten().and_then(|n| icons.get(n));
-    let gold_drawn = if skinned && let Some(ir) = icon_rect {
+    let gold_drawn = if whole.is_some() {
+        true
+    } else if skinned && let Some(ir) = icon_rect {
         let mut orb_painter = painter.clone();
         if !ready || locked {
             orb_painter.multiply_opacity(0.45);
