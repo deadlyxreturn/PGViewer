@@ -16,6 +16,6 @@ The viewer looks up each picture by name here (also in a `skin` folder beside th
 | `slider-thumb.png`, `slider-thumb-blue.png`, `slider-thumb-green.png` | Heart slider knobs; sliders go pink, pink, pink, blue, blue, blue, green down a page |
 | `record-button.png`, `record-button-active.png` | Recorder RECORD / STOP |
 | `icons/pg-*.png` | Interface icons |
-| `toolbar/` | The 16 labelled PG toolbar buttons (`conversations.png` …), faces, avatar frame, badges and `layout.json` |
+| `toolbar/` | PG button faces (9-sliced to any width), avatar frame, badges and `layout.json` (heart colour and label per button) |
 
 Icon glyphs are based on Tabler Icons; see `TABLER-ICONS-LICENSE.txt`.
