@@ -9,14 +9,12 @@ The viewer looks up each picture by name here (also in a `skin` folder beside th
 | `cursor.png` | The heart mouse pointer (its tip at the top left) |
 | `login-crest.png` | Star-heart crest above the login card |
 | `app-icon.png`, `pg-viewer.ico` + `pg-viewer.png` | App, taskbar, shortcut and installer icon |
-| `login-frame.svg`, `login-button.png` | Login card frame and LOG IN face |
+| `login-button.png` | LOG IN face (the card's pink frame is drawn) |
 | `button-gold.png`, `button-red.png` | Green OK / Apply / Reset and pink Cancel faces |
 | `ball-1.png` … `ball-7.png` | Heart emblems: pink, blue, blue, pink, green, green, pink |
 | `slider-thumb.png`, `slider-thumb-blue.png`, `slider-thumb-green.png` | Heart slider knobs; sliders go pink, pink, pink, blue, blue, blue, green down a page |
-| `cloud-scroll.png` | Gold cloud ornaments of the login card |
 | `record-button.png`, `record-button-active.png` | Recorder RECORD / STOP |
 | `icons/pg-*.png` | Interface icons |
-| `toolbar/` | Toolbar faces, avatar frame, badges and `layout.json` (heart and label per button) |
-| `messenger/`, `notifications/` | Messenger and notification art |
+| `toolbar/` | The 16 labelled PG toolbar buttons (`conversations.png` …), faces, avatar frame, badges and `layout.json` |
 
 Icon glyphs are based on Tabler Icons; see `TABLER-ICONS-LICENSE.txt`.

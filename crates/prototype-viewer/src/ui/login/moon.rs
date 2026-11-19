@@ -88,7 +88,7 @@ pub(super) fn card_face(ctx: &egui::Context, rect: Rect) -> Shape {
     }
     let mut v = vec![
         // the warm outer glow
-        Shape::rect_stroke(rect.expand(4.0), radius + 4.0, Stroke::new(9.0, Color32::from_rgba_unmultiplied(255, 54, 132, 34)), StrokeKind::Outside),
+        Shape::rect_stroke(rect.expand(4.0), radius + 4.0, Stroke::new(10.0, Color32::from_rgba_unmultiplied(255, 64, 190, 60)), StrokeKind::Outside),
         gradient_rect_shape(
             ctx,
             rect,
@@ -99,10 +99,11 @@ pub(super) fn card_face(ctx: &egui::Context, rect: Rect) -> Shape {
     ];
     let sheen = Rect::from_min_max(rect.min + vec2(6.0, 6.0), pos2(rect.right() - 6.0, rect.top() + rect.height() * 0.3));
     v.push(gradient_rect_shape(ctx, sheen, radius - 6.0, Color32::from_white_alpha(22), Color32::TRANSPARENT));
-    v.push(Shape::rect_stroke(rect, radius, Stroke::new(4.0, Color32::from_rgb(105, 44, 4)), StrokeKind::Outside));
-    v.push(Shape::rect_stroke(rect, radius, Stroke::new(3.0, Color32::from_rgb(240, 160, 30)), StrokeKind::Inside));
-    v.push(Shape::rect_stroke(rect.shrink(3.0), radius - 3.0, Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 236, 170, 170)), StrokeKind::Inside));
-    v.push(Shape::rect_stroke(rect.shrink(7.0), radius - 7.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 190, 80, 60)), StrokeKind::Inside));
+    // PG Viewer: the mockup's glossy hot-pink frame
+    v.push(Shape::rect_stroke(rect, radius, Stroke::new(4.0, Color32::from_rgb(90, 10, 70)), StrokeKind::Outside));
+    v.push(Shape::rect_stroke(rect, radius, Stroke::new(4.0, Color32::from_rgb(255, 70, 190)), StrokeKind::Inside));
+    v.push(Shape::rect_stroke(rect.shrink(4.0), radius - 4.0, Stroke::new(1.4, Color32::from_rgba_unmultiplied(255, 200, 240, 190)), StrokeKind::Inside));
+    v.push(Shape::rect_stroke(rect.shrink(8.0), radius - 8.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 110, 210, 70)), StrokeKind::Inside));
     Shape::Vec(v)
 }
 
