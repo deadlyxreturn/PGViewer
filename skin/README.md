@@ -7,6 +7,7 @@ The viewer looks up each picture by name here (also in a `skin` folder beside th
 | `background.png` | Login wallpaper (Townsville at night) |
 | `loading-runner.gif` | The girls flying across the loading and teleport screens; the green background is keyed out |
 | `cursor.png` | The heart mouse pointer (its tip at the top left) |
+| `wordmark.png` | The big PG VIEWER logo at the top right of the login screen |
 | `login-crest.png` | Star-heart crest above the login card |
 | `app-icon.png`, `pg-viewer.ico` + `pg-viewer.png` | App, taskbar, shortcut and installer icon |
 | `login-button.png` | LOG IN face (the card's pink frame is drawn) |

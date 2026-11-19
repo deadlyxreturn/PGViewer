@@ -183,15 +183,17 @@ pub(super) fn card_ornaments(ctx: &egui::Context, card: Rect) {
     }
     // the skin's `wordmark` large at the top of the screen
     if let Some(t) = dragon_art::texture(ctx, "wordmark") {
-        // where the mockup (1448 × 1086) has it on the art: between the two
-        // characters, over their shoulders
+        // PG Viewer: at the top right of the Townsville art (1280 × 720),
+        // as in the concept, clear of the girls
         let screen = ctx.content_rect();
-        let (k, art) = super::super::prototype_art::art_map(ctx, screen, vec2(1448.0, 1086.0));
-        let width = (440.0 * k).min(screen.width() * 0.4);
+        let (k, art) = super::super::prototype_art::art_map(ctx, screen, vec2(1280.0, 720.0));
+        let width = (430.0 * k).min(screen.width() * 0.36);
         let [w, h] = t.size();
+        let height = width * h as f32 / w.max(1) as f32;
+        let center_x = (art.x + 1040.0 * k).min(screen.right() - 16.0 - width * 0.5);
         let rect = Rect::from_center_size(
-            pos2(art.x + 848.0 * k, (art.y + 145.0 * k).max(screen.top() + 40.0 + width * 0.18)),
-            vec2(width, width * h as f32 / w.max(1) as f32),
+            pos2(center_x, (art.y + 110.0 * k).max(screen.top() + 34.0 + height * 0.5)),
+            vec2(width, height),
         );
         let back = ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("ds_login_wordmark")));
         back.image(t.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
