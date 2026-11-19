@@ -1,0 +1,101 @@
+<#
+.SYNOPSIS
+    Builds a local Windows x64 release and writes its unsigned installer,
+    portable update archive, update policy and SHA-256 checksums.
+.EXAMPLE
+    ./scripts/build-release.ps1 -Tag v0.1.0 -Makensis 'C:\Program Files (x86)\NSIS\makensis.exe'
+.EXAMPLE
+    ./scripts/build-release.ps1 -SkipBuild -Exe target/release/pg-viewer.exe -Out C:\builds\pg-viewer-0.1.0
+#>
+[CmdletBinding(DefaultParameterSetName = 'Build')]
+param(
+    [ValidatePattern('^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$')][string]$Tag = 'v0.1.0',
+    [string]$Out,
+    [string]$Makensis = 'makensis.exe',
+    [Parameter(Mandatory, ParameterSetName = 'Package')][switch]$SkipBuild,
+    [Parameter(Mandatory, ParameterSetName = 'Package')][string]$Exe
+)
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot -Parent
+$compiler = (Get-Command -Name $Makensis -CommandType Application | Select-Object -First 1).Source
+if (-not $Out) { $Out = Join-Path $repo "target/pg-viewer-dist/$Tag" }
+$dist = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
+if (Test-Path -LiteralPath $dist) { throw "The release output path already exists: $dist" }
+
+if (-not $SkipBuild) {
+    $oldTag = [Environment]::GetEnvironmentVariable('PROTOTYPE_VERSION_TAG', 'Process')
+    Push-Location -LiteralPath $repo
+    try {
+        $env:PROTOTYPE_VERSION_TAG = $Tag
+        cargo build --release --locked --target x86_64-pc-windows-msvc --target-dir target -p prototype-viewer --bin pg-viewer --features xr-static-loader
+        if ($LASTEXITCODE -ne 0) { throw "Cargo failed with exit code $LASTEXITCODE." }
+    } finally {
+        [Environment]::SetEnvironmentVariable('PROTOTYPE_VERSION_TAG', $oldTag, 'Process')
+        Pop-Location
+    }
+    $Exe = Join-Path $repo 'target/x86_64-pc-windows-msvc/release/pg-viewer.exe'
+}
+$exePath = (Resolve-Path -LiteralPath $Exe).Path
+# A prebuilt viewer must contain a Windows AMD64 PE header before we run it.
+$pe = [IO.BinaryReader]::new([IO.File]::OpenRead($exePath))
+try {
+    if ($pe.ReadUInt16() -ne 0x5a4d) { throw "Invalid Windows executable: $exePath" }
+    $pe.BaseStream.Position = 0x3c
+    $pe.BaseStream.Position = $pe.ReadInt32()
+    if ($pe.ReadUInt32() -ne 0x00004550 -or $pe.ReadUInt16() -ne 0x8664) {
+        throw "The package requires an x64 Windows executable: $exePath"
+    }
+} finally {
+    $pe.Dispose()
+}
+& "$PSScriptRoot/verify-version.ps1" -Exe $exePath -Tag $Tag
+
+$version = $Tag.Substring(1)
+$packageName = "PG-Viewer-$Tag-windows-x64"
+$parent = Split-Path $dist -Parent
+New-Item -ItemType Directory -Force -Path $parent | Out-Null
+$parent = (Resolve-Path -LiteralPath $parent).Path
+$stageName = ".pg-viewer-staging-$([Guid]::NewGuid().ToString('N'))"
+$stage = Join-Path $parent $stageName
+New-Item -ItemType Directory -Path $stage | Out-Null
+try {
+    $release = Join-Path $stage 'release'
+    New-Item -ItemType Directory -Path $release | Out-Null
+    $packageDir = Join-Path $stage $packageName
+    $archive = Join-Path $release "$packageName.zip"
+    $setup = Join-Path $release "PG-Viewer-Setup-$version.exe"
+    & "$PSScriptRoot/package.ps1" -Exe $exePath -Out $packageDir
+    # The recorder encodes with FFmpeg (GPL build, its licence beside it),
+    # shipped next to the viewer so recording works out of the box
+    $ffZip = Join-Path $stage 'ffmpeg.zip'
+    $ffDir = Join-Path $stage 'ffmpeg-dl'
+    Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip' -OutFile $ffZip
+    Expand-Archive -LiteralPath $ffZip -DestinationPath $ffDir
+    $ffBin = Get-ChildItem -LiteralPath $ffDir -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+    if (-not $ffBin) { throw 'ffmpeg.exe not found in the download' }
+    Copy-Item -LiteralPath $ffBin.FullName -Destination (Join-Path $packageDir 'ffmpeg.exe')
+    $ffLicense = Get-ChildItem -LiteralPath $ffDir -Recurse -Filter LICENSE.txt | Select-Object -First 1
+    if ($ffLicense) { Copy-Item -LiteralPath $ffLicense.FullName -Destination (Join-Path $packageDir 'ffmpeg-LICENSE.txt') }
+    Remove-Item -LiteralPath $ffZip, $ffDir -Recurse -Force
+    # Windows tar writes ZIP paths with forward slashes, including the package root.
+    & tar.exe -a -cf $archive -C $stage $packageName
+    if ($LASTEXITCODE -ne 0) { throw "ZIP creation failed with exit code $LASTEXITCODE." }
+    & "$PSScriptRoot/write-update-policy.ps1" -Tag $Tag -Out (Join-Path $release 'pg-viewer-update-policy.json')
+
+    $installerScript = Join-Path $repo 'packaging/windows/pg-viewer.nsi'
+    & $compiler /WX /V2 "/DVERSION=$version" "/DSRC=$packageDir" "/DOUTPUT=$setup" $installerScript
+    if ($LASTEXITCODE -ne 0) { throw "NSIS failed with exit code $LASTEXITCODE." }
+    foreach ($artifact in Get-Item -LiteralPath $archive, $setup) {
+        $hash = (Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $($artifact.Name)" | Set-Content -LiteralPath "$($artifact.FullName).sha256" -Encoding ASCII
+    }
+    [IO.Directory]::Move($release, $dist)
+} finally {
+    $resolved = Get-Item -LiteralPath $stage -Force
+    if ($resolved.Parent.FullName -ne $parent -or $resolved.Name -cne $stageName -or
+        ($resolved.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Refused to remove a staging directory outside $parent."
+    }
+    Remove-Item -LiteralPath $resolved.FullName -Recurse -Force
+}
+Write-Host "Windows release artifacts: $dist"

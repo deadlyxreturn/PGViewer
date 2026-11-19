@@ -1,0 +1,155 @@
+; Build through scripts/build-release.ps1, which sets VERSION, SRC and OUTPUT.
+Unicode true
+!include "MUI2.nsh"
+!include "x64.nsh"
+
+!define INSTALL_KEY "Software\PGViewer"
+!define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\PGViewer"
+!define VIEWER "pg-viewer.exe"
+!define UNINSTALLER "Uninstall PG Viewer.exe"
+!define ICON "assets\branding\pg-viewer.ico"
+
+Name "PG Viewer ${VERSION}"
+OutFile "${OUTPUT}"
+InstallDir "$LOCALAPPDATA\Programs\PGViewer"
+InstallDirRegKey HKCU "${INSTALL_KEY}" "InstallDir"
+RequestExecutionLevel user
+SetCompressor /SOLID lzma
+BrandingText "PG Viewer"
+
+VIProductVersion "${VERSION}.0"
+VIAddVersionKey "ProductName" "PG Viewer"
+VIAddVersionKey "CompanyName" "PG Viewer"
+VIAddVersionKey "FileDescription" "PG Viewer installer"
+VIAddVersionKey "FileVersion" "${VERSION}"
+VIAddVersionKey "LegalCopyright" "PG Viewer contributors. See NOTICE.md. GPLv3 or later."
+
+!define MUI_ICON "..\..\assets\branding\pg-viewer.ico"
+!define MUI_UNICON "..\..\assets\branding\pg-viewer.ico"
+!define MUI_ABORTWARNING
+!define MUI_WELCOMEPAGE_TITLE "Install PG Viewer ${VERSION}"
+!define MUI_WELCOMEPAGE_TEXT "PG Viewer is an independent viewer for Second Life.$\r$\n$\r$\nThis software is not provided or supported by Linden Lab, the makers of Second Life.$\r$\n$\r$\nClick Next to continue."
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${VIEWER}"
+!define MUI_FINISHPAGE_RUN_TEXT "Start PG Viewer"
+!define MUI_FINISHPAGE_RUN_NOTCHECKED
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "..\..\LICENSE"
+!insertmacro MUI_PAGE_COMPONENTS
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+Function .onInit
+  ${IfNot} ${RunningX64}
+    MessageBox MB_OK|MB_ICONSTOP "PG Viewer requires 64-bit Windows." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  ${EndIf}
+FunctionEnd
+
+Function .onVerifyInstDir
+  Call CheckInstallDir
+FunctionEnd
+
+Function CheckInstallDir
+  ; An existing install can be upgraded. A new install needs an empty folder.
+  ReadRegStr $0 HKCU "${INSTALL_KEY}" "InstallDir"
+  StrCmp $INSTDIR $0 valid
+  ClearErrors
+  FindFirst $0 $1 "$INSTDIR\*"
+  IfErrors valid
+  next:
+    StrCmp $1 "" empty
+    StrCmp $1 "." skip
+    StrCmp $1 ".." skip
+    FindClose $0
+    Abort
+  skip:
+    FindNext $0 $1
+    IfErrors empty next
+  empty:
+    FindClose $0
+  valid:
+FunctionEnd
+
+Section "PG Viewer" SecMain
+  SectionIn RO
+  ; Also enforce the folder check for silent installs that skip the page.
+  Call CheckInstallDir
+  SetOutPath "$INSTDIR"
+  File /r "${SRC}\*.*"
+  WriteUninstaller "$INSTDIR\${UNINSTALLER}"
+  CreateDirectory "$SMPROGRAMS\PG Viewer"
+  CreateShortcut "$SMPROGRAMS\PG Viewer\PG Viewer.lnk" "$INSTDIR\${VIEWER}" "" "$INSTDIR\${VIEWER}" 0
+  CreateShortcut "$SMPROGRAMS\PG Viewer\Uninstall PG Viewer.lnk" "$INSTDIR\${UNINSTALLER}" "" "$INSTDIR\${ICON}"
+
+  WriteRegStr HKCU "${INSTALL_KEY}" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "PG Viewer"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "PG Viewer"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\${VIEWER},0"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" "$\"$INSTDIR\${UNINSTALLER}$\""
+  WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
+  WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
+  ; Windows keeps old icons in its cache (an earlier install's icon on a
+  ; pinned taskbar button): tell the shell icons changed so it reloads them.
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0x1000, p 0, p 0)'
+SectionEnd
+
+Section "Desktop shortcut" SecDesktop
+  CreateShortcut "$DESKTOP\PG Viewer.lnk" "$INSTDIR\${VIEWER}" "" "$INSTDIR\${VIEWER}" 0
+SectionEnd
+
+!insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "Install the viewer and create Start menu shortcuts."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "Create a PG Viewer shortcut on the desktop."
+!insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+Section "Uninstall"
+  SetOutPath "$TEMP"
+  ClearErrors
+  Delete "$INSTDIR\${VIEWER}"
+  IfErrors 0 removeFiles
+    MessageBox MB_OK|MB_ICONSTOP "Close PG Viewer and run the uninstaller again." /SD IDOK
+    SetErrorLevel 1
+    Abort
+  removeFiles:
+  Delete "$INSTDIR\${UNINSTALLER}"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\ffmpeg.exe"
+  Delete "$INSTDIR\ffmpeg-LICENSE.txt"
+  Delete "$INSTDIR\NOTICE.md"
+  Delete "$INSTDIR\README.md"
+  Delete "$INSTDIR\PRIVACY.md"
+  Delete "$INSTDIR\pg-viewer-install.json"
+  Delete "$INSTDIR\${ICON}"
+  Delete "$INSTDIR\assets\dictionaries\README.md"
+  Delete "$INSTDIR\assets\dictionaries\*-LICENSE.txt"
+  Delete "$INSTDIR\assets\emoji\LICENSE-OFL.txt"
+  Delete "$INSTDIR\assets\fonts\LICENSE-*.txt"
+  Delete "$INSTDIR\assets\icons\LICENSE-tabler.txt"
+  Delete "$INSTDIR\assets\lsl\PREPROCESSOR-LICENSE.txt"
+  Delete "$INSTDIR\assets\stars\LICENSE-HYG.md"
+  Delete "$INSTDIR\assets\stars\LICENSE-TYCHO2.md"
+  RMDir "$INSTDIR\assets\branding"
+  RMDir "$INSTDIR\assets\dictionaries"
+  RMDir "$INSTDIR\assets\emoji"
+  RMDir "$INSTDIR\assets\fonts"
+  RMDir "$INSTDIR\assets\icons"
+  RMDir "$INSTDIR\assets\lsl"
+  RMDir "$INSTDIR\assets\stars"
+  RMDir "$INSTDIR\assets"
+  RMDir "$INSTDIR"
+
+  Delete "$DESKTOP\PG Viewer.lnk"
+  Delete "$SMPROGRAMS\PG Viewer\PG Viewer.lnk"
+  Delete "$SMPROGRAMS\PG Viewer\Uninstall PG Viewer.lnk"
+  RMDir "$SMPROGRAMS\PG Viewer"
+  DeleteRegKey HKCU "${UNINSTALL_KEY}"
+  DeleteRegKey HKCU "${INSTALL_KEY}"
+SectionEnd

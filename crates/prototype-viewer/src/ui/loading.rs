@@ -1,0 +1,903 @@
+//! Loading (after login) and teleport screens share a full-screen banner over
+//! starlight and either the last view blurred or the Moon Palace. The place
+//! is written large at the bottom left with what is known of it
+//! (classification, arrival point, residents), its world map tile and the
+//! progress in figures sit at the bottom right, and the progress itself is a
+//! line of light along the bottom edge.
+
+use crate::theme::Palette;
+use egui::epaint::{Mesh, Vertex, WHITE_UV};
+use egui::{Color32, Pos2, Rect, Shape, Vec2};
+
+pub struct LoadingInfo<'a> {
+    pub stage: &'a str,
+    pub fraction: f32,
+    pub region: &'a str,
+    pub objects: usize,
+    pub textures: (usize, usize),
+    pub terrain: f32,
+    pub elapsed: f32,
+}
+
+/// What is known of the place being loaded, beyond its name.
+#[derive(Default)]
+pub struct Place<'a> {
+    /// Classification label (`bars::maturity_name`), empty when unknown.
+    pub maturity: &'a str,
+    /// Arrival point "x, y, z", empty when unknown.
+    pub position: &'a str,
+    /// Residents in the region.
+    pub residents: Option<usize>,
+    /// World map tile of the region.
+    pub tile: Option<&'a egui::TextureHandle>,
+    /// Arrival point on the tile, 0..1 from its south-west corner.
+    pub pin: Option<(f32, f32)>,
+}
+
+/// The facts of a `Place`, gathered by the app each frame the banner shows.
+#[derive(Default)]
+pub struct PlaceFacts {
+    pub maturity: &'static str,
+    pub position: String,
+    pub residents: Option<usize>,
+    pub tile: Option<egui::TextureHandle>,
+    pub pin: Option<(f32, f32)>,
+}
+
+impl PlaceFacts {
+    pub fn place(&self) -> Place<'_> {
+        Place {
+            maturity: self.maturity,
+            position: &self.position,
+            residents: self.residents,
+            tile: self.tile.as_ref(),
+            pin: self.pin,
+        }
+    }
+
+    /// What the viewer knows of the region `name`. `arrived`: it is the
+    /// region we are in (its handshake and coarse locations are there);
+    /// otherwise only the world map may know it, and its residents are asked
+    /// for (MapItemRequest, throttled by the map).
+    pub fn gather(
+        world: &mut crate::world::World,
+        tiles: &mut super::map_tiles::MapTiles,
+        name: &str,
+        position: Option<glam::Vec3>,
+        arrived: bool,
+    ) -> PlaceFacts {
+        let mut facts = PlaceFacts::default();
+        // @showloc: the classification, the arrival point, the head count and
+        // the map tile each tell the place apart; the Legacy Viewer's progress
+        // view (LLProgressView) shows none of them.
+        if world.rlva.has("showloc") {
+            return facts;
+        }
+        if let Some(pos) = position {
+            facts.position = format!("{:.0}, {:.0}, {:.0}", pos.x, pos.y, pos.z);
+        }
+        let main = world.main_region.filter(|_| arrived);
+        let grid = match main {
+            Some(handle) => Some(((handle >> 32) as u32 / 256, (handle & 0xffff_ffff) as u32 / 256)),
+            None => world.map.region_by_name(name),
+        };
+        let Some(key) = grid else {
+            return facts;
+        };
+        let sim = world.map.sims.get(&key);
+        let size = sim.map_or(256.0, |s| s.size_x.max(1) as f32);
+        facts.maturity = match main.and_then(|h| world.regions.get(&h)).and_then(|r| r.info.as_ref()) {
+            Some(info) => super::bars::maturity_name(info.sim_access),
+            None => sim.map_or("", |s| super::bars::maturity_name(s.access)),
+        };
+        facts.residents = match main {
+            Some(handle) => world.coarse.get(&handle).map(Vec::len).filter(|n| *n > 0),
+            None => {
+                world.map.want_agents(key);
+                world
+                    .map
+                    .agents
+                    .get(&key)
+                    .map(|spots| spots.iter().map(|(_, _, count)| (*count).max(0) as usize).sum())
+            }
+        };
+        facts.tile = tiles.get(1, key.0, key.1, true).ok();
+        facts.pin = position.map(|pos| (pos.x / size, pos.y / size));
+        facts
+    }
+}
+
+/// Split a teleport destination "Region (x, y, z)" into the region and the
+/// arrival point; a destination without a point (a landmark, home) is all
+/// name.
+pub fn split_destination(dest: &str) -> (&str, Option<glam::Vec3>) {
+    let Some((name, point)) = dest.rsplit_once('(') else {
+        return (dest.trim(), None);
+    };
+    let mut numbers = point.trim_end_matches(')').split(',').map(|n| n.trim().parse::<f32>());
+    match (numbers.next(), numbers.next(), numbers.next(), numbers.next()) {
+        (Some(Ok(x)), Some(Ok(y)), Some(Ok(z)), None) => (name.trim(), Some(glam::Vec3::new(x, y, z))),
+        _ => (dest.trim(), None),
+    }
+}
+
+/// The region a teleport screen names, and the arrival point it may show,
+/// from the destination "Region (x, y, z)" (empty: the region we are in).
+/// Under @showloc neither is told: the screen says what the location bar
+/// says of the current region (RlvStrings::getString(RlvStringKeys::Hidden::
+/// Region)); the Legacy Viewer's own progress view never names the place.
+pub fn banner_place(world: &crate::world::World, dest: &str) -> (String, Option<glam::Vec3>) {
+    if world.rlva.has("showloc") {
+        return (world.rlva_region_label(), None);
+    }
+    let (region, point) = split_destination(dest);
+    let name = if region.is_empty() {
+        world.region_name()
+    } else {
+        region.to_owned()
+    };
+    (name, point)
+}
+
+/// Fade-out duration of the loading / teleport screens.
+pub const FADE_SECONDS: f32 = 0.7;
+
+/// Rectangle blending two colors: left to right when `horizontal`, else top
+/// to bottom.
+pub(crate) fn gradient_rect(painter: &egui::Painter, r: Rect, a: Color32, b: Color32, horizontal: bool) {
+    let mut m = Mesh::default();
+    let v = |pos: Pos2, color: Color32| Vertex { pos, uv: WHITE_UV, color };
+    let (right_top, left_bottom) = if horizontal { (b, a) } else { (a, b) };
+    m.vertices.push(v(r.left_top(), a));
+    m.vertices.push(v(r.right_top(), right_top));
+    m.vertices.push(v(r.right_bottom(), b));
+    m.vertices.push(v(r.left_bottom(), left_bottom));
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(0, 2, 3);
+    painter.add(Shape::mesh(m));
+}
+
+/// The filled part of a progress track. `fraction` None = moving segment
+/// (unknown duration).
+fn progress_fill(r: Rect, fraction: Option<f32>, t: f32) -> Rect {
+    match fraction {
+        Some(f) => Rect::from_min_size(r.min, Vec2::new(r.width() * f.clamp(0.0, 1.0), r.height())),
+        None => {
+            let seg = r.width() * 0.28;
+            let u = 0.5 - 0.5 * (t * 2.2).cos();
+            Rect::from_min_size(Pos2::new(r.left() + (r.width() - seg) * u, r.top()), Vec2::new(seg, r.height()))
+        }
+    }
+}
+
+/// The lit part of the banner's progress line: the brand gradient, a small
+/// curtain rising from it (waving, taller toward the head), a sheen that
+/// travels along it and a bright core at its head.
+fn progress_light(painter: &egui::Painter, p: &Palette, fill: Rect, k: f32, t: f32, alpha: f32) {
+    let a = alpha.clamp(0.0, 1.0);
+    gradient_rect(painter, fill, p.violet.gamma_multiply(a), p.teal.gamma_multiply(a), true);
+
+    // Curtain: a strip of quads above the line, opaque at its
+    // foot and transparent at its waving top
+    const SEGMENTS: usize = 64;
+    let mut curtain = Mesh::default();
+    for i in 0..=SEGMENTS {
+        let u = i as f32 / SEGMENTS as f32;
+        let x = fill.left() + fill.width() * u;
+        // two waves of different lengths drifting against each other
+        let wave = 0.62 + 0.38 * (x * 0.021 / k + t * 1.25).sin() * (x * 0.0083 / k - t * 0.7).cos();
+        // rises toward the head, then falls into its halo instead of ending on an edge
+        let toward_head = u.powf(1.6) * (1.0 - ((u - 0.9) / 0.1).clamp(0.0, 1.0).powi(2));
+        let height = k * (8.0 + 44.0 * toward_head) * wave;
+        let color = p.violet.lerp_to_gamma(p.teal, u);
+        let foot = color.gamma_multiply(a * (0.10 + 0.34 * toward_head));
+        let v = |pos: Pos2, color: Color32| Vertex { pos, uv: WHITE_UV, color };
+        curtain.vertices.push(v(Pos2::new(x, fill.top()), foot));
+        curtain.vertices.push(v(Pos2::new(x, fill.top() - height), Color32::TRANSPARENT));
+        if i > 0 {
+            let n = (i * 2) as u32;
+            curtain.add_triangle(n - 2, n - 1, n);
+            curtain.add_triangle(n - 1, n + 1, n);
+        }
+    }
+    painter.add(Shape::mesh(curtain));
+
+    // sheen: a highlight crossing the lit part every few seconds
+    let width = (120.0 * k).min(fill.width());
+    let travel = fill.width() + width;
+    let center = fill.left() - width / 2.0 + travel * (t * 0.32).fract();
+    // theme-guard: brand — the light of the sheen, whatever the skin
+    let sheen = Color32::WHITE.gamma_multiply(0.6 * a);
+    let lit = painter.with_clip_rect(fill.intersect(painter.clip_rect()));
+    let left = Rect::from_min_max(Pos2::new(center - width / 2.0, fill.top()), Pos2::new(center, fill.bottom()));
+    let right = Rect::from_min_max(Pos2::new(center, fill.top()), Pos2::new(center + width / 2.0, fill.bottom()));
+    gradient_rect(&lit, left, Color32::TRANSPARENT, sheen, true);
+    gradient_rect(&lit, right, sheen, Color32::TRANSPARENT, true);
+
+    // head: a soft halo breathing around a bright core
+    let head = Pos2::new(fill.right(), fill.center().y);
+    let breathe = 0.8 + 0.2 * (t * 3.1).sin();
+    super::prototype_bg::radial_glow(painter, head, 30.0 * k, p.teal, 0.5 * breathe * a);
+    super::prototype_bg::radial_glow(painter, head, 9.0 * k, p.ink, 0.95 * a);
+}
+
+/// PG Viewer's loading progress: seven orbs to gather across the bottom.
+/// Each one gathered (the progress past its seventh) shines in place, the
+/// next one floats down pulsing toward its spot, the others wait faint.
+/// Without a known progress they light up one after another.
+fn gather_orbs(painter: &egui::Painter, screen: Rect, y: f32, k: f32, fraction: Option<f32>, t: f32, alpha: f32) {
+    let r = 22.0 * k;
+    let gap = 26.0 * k;
+    let width = 7.0 * 2.0 * r + 6.0 * gap;
+    let left = screen.center().x - width / 2.0 + r;
+    let gathered = match fraction {
+        Some(f) => f.clamp(0.0, 1.0) * 7.0,
+        None => (t * 1.6) % 8.0,
+    };
+    // the power-up aura behind the row: a band of energy breathing, and
+    // sparks rising from the bottom of the screen, faster as it loads
+    let power = gathered / 7.0;
+    let band = Rect::from_center_size(Pos2::new(screen.center().x, y), Vec2::new(width + 8.0 * r, r * 5.0));
+    let breathe = 0.7 + 0.3 * (t * 3.0).sin();
+    super::dragon_art::glow(painter, band.center(), width * 0.42, Color32::from_rgb(255, 54, 132), alpha * (0.35 + 0.65 * power) * breathe);
+    let hash = |i: u32, k: f32| ((i as f32 * 12.9898 + k * 78.233).sin() * 43758.547).fract().abs();
+    for i in 0..48u32 {
+        let speed = 40.0 + 90.0 * hash(i, 1.0) + 120.0 * power;
+        let x = screen.left() + screen.width() * (0.2 + 0.6 * hash(i, 2.0)) + (t * 1.7 + i as f32).sin() * 10.0 * k;
+        let travel = screen.height() * 0.55;
+        let rise = (t * speed + hash(i, 3.0) * travel) % travel;
+        let at = Pos2::new(x, screen.bottom() - rise);
+        let life = 1.0 - rise / travel;
+        let size = (1.2 + 2.2 * hash(i, 4.0)) * k;
+        let c = Color32::from_rgb(255, 200, 80).lerp_to_gamma(Color32::from_rgb(255, 40, 128), hash(i, 5.0));
+        painter.circle_filled(at, size, c.gamma_multiply(alpha * life * (0.4 + 0.6 * power)));
+    }
+    for i in 0..7 {
+        let center = Pos2::new(left + i as f32 * (2.0 * r + gap), y);
+        let progress = (gathered - i as f32).clamp(0.0, 1.0);
+        let mut orb = painter.clone();
+        if progress >= 1.0 {
+            orb.multiply_opacity(alpha);
+            let breathe = 0.85 + 0.15 * (t * 2.0 + i as f32).sin();
+            super::dragon_art::glow(&orb, center, r * 1.9, Color32::from_rgb(255, 63, 135), breathe);
+            // its aura: flickering tongues of light rising off it
+            for f in 0..3 {
+                let ph = t * 4.0 + i as f32 * 1.3 + f as f32 * 2.1;
+                let lift = (ph * 0.5).fract();
+                let at = center + Vec2::new((ph * 1.7).sin() * r * 0.35, -r * (0.6 + 1.4 * lift));
+                super::dragon_art::glow(&orb, at, r * (0.9 - 0.5 * lift), Color32::from_rgb(255, 180, 40), 0.8 * (1.0 - lift));
+            }
+            super::dragon_art::orb(&orb, center, r, i as u8 + 1);
+        } else if progress > 0.0 {
+            // the one being gathered: falls from above into place, pulsing
+            let fall = (1.0 - progress) * 120.0 * k;
+            let pulse = 0.6 + 0.4 * (t * 6.0).sin();
+            orb.multiply_opacity(alpha * (0.45 + 0.55 * progress));
+            super::dragon_art::glow(&orb, center - Vec2::new(0.0, fall), r * 2.2, Color32::from_rgb(69, 216, 255), pulse);
+            super::dragon_art::orb(&orb, center - Vec2::new(0.0, fall), r * (0.8 + 0.2 * progress), i as u8 + 1);
+            // its waiting spot
+            painter.circle_stroke(center, r, egui::Stroke::new(1.5, Color32::from_rgba_unmultiplied(255, 200, 90, (90.0 * alpha) as u8)));
+        } else {
+            orb.multiply_opacity(alpha * 0.22);
+            super::dragon_art::orb(&orb, center, r * 0.86, i as u8 + 1);
+            painter.circle_stroke(center, r, egui::Stroke::new(1.2, Color32::from_rgba_unmultiplied(255, 200, 90, (60.0 * alpha) as u8)));
+        }
+    }
+}
+
+/// What starts a fact about the place: an icon or a colored letter.
+enum Lead<'a> {
+    Icon(&'a str),
+    Letter(&'a str, Color32, Color32),
+}
+
+/// Paint a fact as a chip from its top left corner; returns its width.
+#[allow(clippy::too_many_arguments)]
+/// The skin's `loading-runner` animation (a GIF; a green background is
+/// keyed out) running along the top of the progress line at the bottom of
+/// the screen, keeping pace with it, and fading away as the load finishes.
+/// While the progress is unknown it runs back and forth.
+fn runner(painter: &egui::Painter, screen: Rect, foot: f32, k: f32, fraction: Option<f32>, t: f32, alpha: f32) {
+    let Some(anim) = super::dragon_art::animation(painter.ctx(), "loading-runner") else {
+        return;
+    };
+    // low and small enough to fit under everything else on the screen
+    let height = (200.0 * k).min(screen.height() * 0.28);
+    let width = height * anim.size.x / anim.size.y.max(1.0);
+    let margin = 24.0 * k;
+    let span = (screen.width() - 2.0 * margin - width).max(0.0);
+    let (along, fade) = match fraction {
+        Some(f) => {
+            let f = f.clamp(0.0, 1.0);
+            // gone by the time the bar is full
+            (f, ((1.0 - f) / 0.06).clamp(0.0, 1.0))
+        }
+        None => {
+            let p = (t * 0.12) % 2.0;
+            (if p < 1.0 { p } else { 2.0 - p }, 1.0)
+        }
+    };
+    let a = alpha * fade;
+    if a <= 0.01 {
+        return;
+    }
+    let rect = Rect::from_min_size(Pos2::new(screen.left() + margin + span * along, foot - height), Vec2::new(width, height));
+    // the power-up aura around him
+    super::dragon_art::glow(painter, rect.center(), height * 0.55, Color32::from_rgb(255, 67, 137), 0.4 * a);
+    painter.image(
+        anim.frame_at(t).id(),
+        rect,
+        Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
+        Color32::WHITE.gamma_multiply(a),
+    );
+    painter.ctx().request_repaint();
+}
+
+fn chip(painter: &egui::Painter, p: &Palette, at: Pos2, k: f32, lead: Lead, text: &str, alpha: f32, radius: egui::CornerRadius) -> f32 {
+    let height = 24.0 * k;
+    let pad = 8.0 * k;
+    let mark = 14.0 * k;
+    let ink = p.ink.gamma_multiply(alpha);
+    let galley = painter.layout_no_wrap(text.to_owned(), egui::FontId::proportional(12.5 * k), ink);
+    let width = pad + mark + 6.0 * k + galley.size().x + pad;
+    let rect = Rect::from_min_size(at, Vec2::new(width, height));
+    let face = Color32::from_rgba_unmultiplied(p.panel.r(), p.panel.g(), p.panel.b(), 168);
+    painter.rect_filled(rect, radius, face.gamma_multiply(alpha));
+    let mark_rect = Rect::from_center_size(Pos2::new(rect.left() + pad + mark / 2.0, rect.center().y), Vec2::splat(mark));
+    match lead {
+        Lead::Icon(name) => {
+            if let Some(texture) = super::icons::global(name) {
+                painter.image(
+                    texture.id(),
+                    mark_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    p.violet_light.gamma_multiply(alpha),
+                );
+            }
+        }
+        Lead::Letter(letter, bg, fg) => {
+            painter.rect_filled(
+                mark_rect,
+                super::widgets::inner_radius(&painter.ctx().global_style().visuals),
+                bg.gamma_multiply(alpha),
+            );
+            let fg = fg.gamma_multiply(alpha);
+            let letter = painter.layout_no_wrap(letter.to_owned(), egui::FontId::proportional(mark * 0.74), fg);
+            super::widgets::paint_ink_centered(painter, letter, mark_rect.center(), fg);
+        }
+    }
+    let text_at = Pos2::new(mark_rect.right() + 6.0 * k, rect.center().y);
+    super::widgets::paint_ink_left(painter, galley, text_at, ink);
+    width
+}
+
+/// The shared banner over `screen`. Painted by hand so everything fades
+/// with `alpha`. Returns the point facing the brand at the top right (for
+/// an optional button).
+#[allow(clippy::too_many_arguments)]
+fn banner(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    p: &Palette,
+    screen: Rect,
+    logo: Option<&egui::TextureHandle>,
+    label: &str,
+    name: &str,
+    stage: &str,
+    fraction: Option<f32>,
+    place: &Place,
+    t: f32,
+    alpha: f32,
+) -> Pos2 {
+    let a = alpha.clamp(0.0, 1.0);
+    // sizes follow the window: designed at 900 px of height
+    let k = (screen.height() / 900.0).clamp(0.7, 1.5);
+    let margin = 48.0 * k;
+    let radius = ctx.global_style().visuals.window_corner_radius;
+    let navy = |opacity: f32| Color32::from_rgba_unmultiplied(p.navy.r(), p.navy.g(), p.navy.b(), (255.0 * opacity * a) as u8);
+
+    // veils: the bottom one carries the text, a light one keeps the brand readable
+    let low = Rect::from_min_max(Pos2::new(screen.left(), screen.top() + screen.height() * 0.42), screen.max);
+    gradient_rect(painter, low, navy(0.0), navy(0.9), false);
+    let high = Rect::from_min_max(screen.min, Pos2::new(screen.right(), screen.top() + screen.height() * 0.2));
+    gradient_rect(painter, high, navy(0.45), navy(0.0), false);
+
+    // brand, top left
+    let brand = Pos2::new(screen.left() + margin, screen.top() + margin * 0.85);
+    let mut brand_text = brand.x;
+    if let Some(l) = logo {
+        let size = 40.0 * k;
+        let rect = Rect::from_min_size(Pos2::new(brand.x, brand.y - size / 2.0), Vec2::splat(size));
+        let breathe = 0.85 + 0.15 * (t * 1.4).sin();
+        super::prototype_bg::radial_glow(painter, rect.center(), size * 1.1, p.violet, 0.4 * breathe * a);
+        painter.image(
+            l.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            super::widgets::PICTURE_TINT.gamma_multiply(a),
+        );
+        brand_text = rect.right() + 12.0 * k;
+    }
+    painter.text(
+        Pos2::new(brand_text, brand.y),
+        egui::Align2::LEFT_CENTER,
+        "PG Viewer",
+        egui::FontId::proportional(15.0 * k),
+        p.violet_pale.gamma_multiply(a),
+    );
+
+    // progress: a line of light along the bottom edge
+    let line_height = (3.0 * k).max(2.0);
+    let track = Rect::from_min_max(Pos2::new(screen.left(), screen.bottom() - line_height), screen.max);
+    painter.rect_filled(track, 0.0, navy(0.55));
+    let fill = progress_fill(track, fraction, t);
+    if fill.width() >= 1.0 {
+        progress_light(&painter.with_clip_rect(screen), p, fill, k, t, a);
+    }
+    gather_orbs(painter, screen, track.top() - 70.0 * k, k, fraction, t, a);
+    runner(painter, screen, track.top(), k, fraction, t, a);
+
+    // bottom right: the region on the world map, and the progress in figures
+    let base = track.top() - margin * 0.8;
+    let mut right = screen.right() - margin;
+    if let Some(tile) = place.tile {
+        let side = 132.0 * k;
+        let rect = Rect::from_min_size(Pos2::new(right - side, base - side), Vec2::splat(side));
+        let mut shadow = ctx.global_style().visuals.window_shadow;
+        shadow.color = shadow.color.gamma_multiply(a);
+        painter.add(shadow.as_shape(rect, radius));
+        painter.add(
+            egui::epaint::RectShape::filled(rect, radius, super::widgets::PICTURE_TINT.gamma_multiply(a))
+                .with_texture(tile.id(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))),
+        );
+        painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, p.ink.gamma_multiply(0.28 * a)),
+            egui::StrokeKind::Inside,
+        );
+        if let Some((x, y)) = place.pin {
+            let at = Pos2::new(
+                rect.left() + rect.width() * x.clamp(0.0, 1.0),
+                rect.bottom() - rect.height() * y.clamp(0.0, 1.0),
+            );
+            let pulse = 0.6 + 0.4 * (t * 2.4).sin().abs();
+            super::prototype_bg::radial_glow(&painter.with_clip_rect(rect), at, 16.0 * k, p.violet_light, 0.7 * pulse * a);
+            painter.circle_filled(at, 3.5 * k, p.ink.gamma_multiply(a));
+            painter.circle_stroke(at, 3.5 * k, egui::Stroke::new(1.5 * k, p.violet.gamma_multiply(a)));
+        }
+        right = rect.left() - 20.0 * k;
+    }
+    if let Some(f) = fraction {
+        let muted = p.muted.gamma_multiply(a);
+        let ink = p.ink.gamma_multiply(a);
+        let sign = painter.layout_no_wrap(" %".to_owned(), egui::FontId::proportional(16.0 * k), muted);
+        let figures = prototype_i18n::number_text(&format!("{:.0}", f.clamp(0.0, 1.0) * 100.0));
+        let figures = painter.layout_no_wrap(figures, egui::FontId::proportional(36.0 * k), ink);
+        let sign_at = Pos2::new(right - sign.size().x, base - sign.size().y - 3.0 * k);
+        let figures_at = Pos2::new(sign_at.x - figures.size().x, base - figures.size().y + 3.0 * k);
+        painter.galley(sign_at, sign, muted);
+        painter.galley(figures_at, figures, ink);
+        right = figures_at.x - 24.0 * k;
+    }
+
+    // bottom left, built upwards: stage, facts, name, label
+    let left = screen.left() + margin;
+    let column = painter.with_clip_rect(Rect::from_min_max(screen.min, Pos2::new(right, screen.bottom())));
+    let mut y = base;
+    if !stage.is_empty() {
+        let muted = p.muted.gamma_multiply(a);
+        let galley = column.layout_no_wrap(stage.to_owned(), egui::FontId::proportional(13.0 * k), muted);
+        y -= galley.size().y;
+        column.galley(Pos2::new(left, y), galley, muted);
+        y -= 12.0 * k;
+    }
+    let mut facts: Vec<(Lead, String)> = Vec::new();
+    if let Some((letter, bg, fg)) = super::widgets::maturity_style(p, place.maturity) {
+        facts.push((Lead::Letter(letter, bg, fg), place.maturity.to_owned()));
+    }
+    if !place.position.is_empty() {
+        facts.push((Lead::Icon("map-pin-filled"), place.position.to_owned()));
+    }
+    if let Some(count) = place.residents {
+        facts.push((Lead::Icon("users"), prototype_i18n::tr!("loading-residents", count = count)));
+    }
+    if !facts.is_empty() {
+        y -= 24.0 * k;
+        let mut x = left;
+        for (lead, text) in facts {
+            x += chip(&column, p, Pos2::new(x, y), k, lead, &text, a, radius) + 6.0 * k;
+        }
+        y -= 14.0 * k;
+    }
+    if !name.is_empty() {
+        // a long name shrinks rather than running under the figures
+        let ink = p.ink.gamma_multiply(a);
+        let room = (right - left).max(120.0);
+        let mut size = 44.0 * k;
+        let mut galley = column.layout_no_wrap(name.to_owned(), egui::FontId::proportional(size), ink);
+        if galley.size().x > room {
+            size = (size * room / galley.size().x).max(22.0 * k);
+            galley = column.layout_no_wrap(name.to_owned(), egui::FontId::proportional(size), ink);
+        }
+        y -= galley.size().y;
+        column.galley(Pos2::new(left, y), galley, ink);
+        y -= 2.0 * k;
+    }
+    if !label.is_empty() {
+        let accent = p.violet_light.gamma_multiply(a);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &label.to_uppercase(),
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(11.5 * k),
+                color: accent,
+                extra_letter_spacing: 1.6 * k,
+                ..Default::default()
+            },
+        );
+        let galley = column.layout_job(job);
+        y -= galley.size().y;
+        column.galley(Pos2::new(left, y), galley, accent);
+    }
+    Pos2::new(screen.right() - margin, screen.top() + margin * 0.85)
+}
+
+/// The stage line of the loading screen: the stage alone until the region
+/// is known, then with what has arrived of it.
+pub fn stage_line(stage: &str, region: &str, terrain: f32, objects: usize, textures: (usize, usize)) -> String {
+    if region.is_empty() {
+        return stage.to_owned();
+    }
+    prototype_i18n::tr!(
+        "status-terrain-objects-textures",
+        value0 = stage.to_string(),
+        value1 = prototype_i18n::number_text(&format!("{:.0}", terrain * 100.0)),
+        value2 = format!("{objects}"),
+        value3 = format!("{}", textures.0),
+        value4 = format!("{}", textures.1)
+    )
+}
+
+/// What a banner says under its title. The app keeps it while the screen
+/// fades out, so that the screen leaves as it was: a line or a fact that
+/// came or went during the fade made the others jump.
+pub struct BannerText {
+    pub name: String,
+    pub stage: String,
+    pub facts: PlaceFacts,
+}
+
+/// Loading screen between login and the first rendered frames.
+pub fn show(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    logo: Option<&egui::TextureHandle>,
+    backdrop: Option<&super::backdrop::Backdrop>,
+    info: &LoadingInfo,
+    place: &Place,
+) -> bool {
+    let ctx = ui.ctx().clone();
+    let screen = ctx.content_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("loading_splash")));
+    let t = ctx.input(|i| i.time) as f32;
+    paint_starlight(&painter, p, screen, backdrop, t, 1.0);
+    let detail = stage_line(info.stage, info.region, info.terrain, info.objects, info.textures);
+    let corner = banner(
+        &ctx,
+        &painter,
+        p,
+        screen,
+        logo,
+        prototype_i18n::tr!("common-loading-world"),
+        info.region,
+        &detail,
+        Some(info.fraction),
+        place,
+        t,
+        1.0,
+    );
+    ctx.request_repaint();
+    let mut cancel = false;
+    if info.elapsed > 20.0 {
+        egui::Area::new(egui::Id::unique("loading_cancel"))
+            .pivot(egui::Align2::RIGHT_CENTER)
+            .fixed_pos(corner)
+            .show(&ctx, |ui| {
+                let label = prototype_i18n::tr!("common-cancel");
+                let kind = super::widgets::ActionKind::Flat;
+                if super::widgets::action_button(ui, p, "x", label, kind, Vec2::new(0.0, 28.0)).clicked() {
+                    cancel = true;
+                }
+            });
+    }
+    cancel
+}
+
+/// A dimmed backdrop with soft pools of light and independently twinkling stars.
+fn paint_starlight(painter: &egui::Painter, p: &Palette, rect: Rect, backdrop: Option<&super::backdrop::Backdrop>, t: f32, alpha: f32) {
+    fn hash(mut x: u32) -> f32 {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        ((x ^ (x >> 16)) & 0xffff) as f32 / 65535.0
+    }
+    let mut has_backdrop = backdrop.is_some_and(|b| b.paint(painter, p, rect, alpha));
+    if !has_backdrop {
+        use super::prototype_art::paint_cover;
+        // PG Viewer: the skin's loading picture, else its login wallpaper
+        let picture = super::dragon_art::texture(painter.ctx(), "loading").or_else(|| super::dragon_art::texture(painter.ctx(), "background"));
+        if let Some(picture) = picture {
+            paint_cover(painter, &picture, rect, super::widgets::PICTURE_TINT.gamma_multiply(alpha));
+            has_backdrop = true;
+        }
+    }
+    let veil = if has_backdrop { 0.62 } else { 1.0 };
+    painter.rect_filled(rect, 0.0, p.navy.gamma_multiply(alpha * veil)); // theme-guard: brand — the starlight screen's veil
+
+    let t = if painter.ctx().global_style().animation_time > 0.0 {
+        t
+    } else {
+        0.0
+    };
+    let at = |x, y| rect.min + Vec2::new(rect.width() * x, rect.height() * y);
+    let scale = (rect.height() / 900.0).clamp(0.7, 1.5);
+    let colors = [p.amber, p.indigo_light, p.rose];
+    for (x, y, color) in [(0.26, 0.25, colors[1]), (0.75, 0.58, colors[2])] {
+        super::prototype_bg::radial_glow(painter, at(x, y), rect.height() * 0.52, color, alpha * 0.10);
+    }
+
+    let stars = ((rect.width() * rect.height()) / 11000.0).clamp(32.0, 144.0) as u32;
+    for i in 0..stars {
+        let seed = hash(i.wrapping_mul(0x9e37_79b9));
+        let center = at(hash(3 * i + 1), hash(3 * i + 2));
+        let pulse = 0.5 + 0.5 * (t * (1.3 + 1.4 * seed) + std::f32::consts::TAU * seed).cos();
+        let light = alpha * (0.24 + 0.76 * pulse * pulse);
+        let color = colors[i as usize % colors.len()];
+        if seed < 0.82 {
+            painter.circle_filled(center, scale * (0.65 + 1.1 * seed), color.gamma_multiply(light));
+            continue;
+        }
+
+        let radius = scale * (5.0 + 6.0 * pulse);
+        super::prototype_bg::radial_glow(painter, center, radius * 2.0, color, light * 0.27);
+        let mut star = Mesh::default();
+        star.vertices.push(Vertex {
+            pos: center,
+            uv: WHITE_UV,
+            color: color.lerp_to_gamma(p.ink, 0.45).gamma_multiply(light),
+        });
+        let tip = radius * 0.18;
+        for offset in [
+            Vec2::new(0.0, -radius),
+            Vec2::new(tip, -tip),
+            Vec2::new(radius * 0.72, 0.0),
+            Vec2::new(tip, tip),
+            Vec2::new(0.0, radius),
+            Vec2::new(-tip, tip),
+            Vec2::new(-radius * 0.72, 0.0),
+            Vec2::new(-tip, -tip),
+        ] {
+            star.vertices.push(Vertex {
+                pos: center + offset,
+                uv: WHITE_UV,
+                color: color.gamma_multiply(light * 0.38),
+            });
+        }
+        for edge in 0..8 {
+            star.add_triangle(0, edge + 1, (edge + 1) % 8 + 1);
+        }
+        painter.add(Shape::mesh(star));
+    }
+}
+
+/// Teleport screen over the world (and the end of the loading screen fading
+/// out): the same banner. With `cancel`, the Cancel button of the login
+/// screen in the same corner (LLProgressView's cancel_btn); true when it was
+/// pressed.
+#[allow(clippy::too_many_arguments)]
+pub fn teleport_overlay(
+    ctx: &egui::Context,
+    p: &Palette,
+    logo: Option<&egui::TextureHandle>,
+    backdrop: Option<&super::backdrop::Backdrop>,
+    title: &str,
+    dest: &str,
+    detail: &str,
+    fraction: Option<f32>,
+    alpha: f32,
+    place: &Place,
+    cancel: bool,
+) -> bool {
+    let a = alpha.clamp(0.0, 1.0);
+    let rect = ctx.content_rect();
+    let t = ctx.input(|i| i.time) as f32;
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("teleport_overlay"));
+    egui::Area::new(layer.id)
+        .order(layer.order)
+        .fixed_pos(rect.min)
+        .fade_in(false)
+        .interactable(a > 0.5)
+        .show(ctx, |ui| {
+            // swallow clicks while it covers the screen
+            ui.allocate_exact_size(rect.size(), egui::Sense::click_and_drag());
+        });
+    // Painted on the layer of the area, not through its `Ui`: egui hides a
+    // new area for its first frame (sizing pass), and the world showed for
+    // that frame between the loading screen and its fade out.
+    let painter = ctx.layer_painter(layer).with_clip_rect(rect);
+    paint_starlight(&painter, p, rect, backdrop, t, a);
+    let corner = banner(ctx, &painter, p, rect, logo, title, dest, detail, fraction, place, t, a);
+    ctx.request_repaint();
+    let mut pressed = false;
+    if cancel && a > 0.5 {
+        let area = egui::Area::new(egui::Id::unique("teleport_cancel"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_CENTER)
+            .fixed_pos(corner)
+            .show(ctx, |ui| {
+                let label = prototype_i18n::tr!("common-cancel");
+                let kind = super::widgets::ActionKind::Flat;
+                pressed = super::widgets::action_button(ui, p, "x", label, kind, Vec2::new(0.0, 28.0)).clicked();
+            });
+        // above the screen's own area, which a click on it raises
+        ctx.move_to_top(area.response.layer_id);
+    }
+    pressed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destination_splits_into_region_and_arrival_point() {
+        assert_eq!(
+            split_destination("Lagune Boréale (128, 64, 30)"),
+            ("Lagune Boréale", Some(glam::Vec3::new(128.0, 64.0, 30.0)))
+        );
+        assert_eq!(split_destination("(12, 34, 56)"), ("", Some(glam::Vec3::new(12.0, 34.0, 56.0))));
+        // a name with parentheses of its own, a landmark, nothing
+        assert_eq!(split_destination("Port (nord)"), ("Port (nord)", None));
+        assert_eq!(split_destination("Domicile"), ("Domicile", None));
+        assert_eq!(split_destination(""), ("", None));
+    }
+
+    /// @showloc: the screen tells neither the destination nor a fact of it.
+    #[test]
+    fn rlva_showloc_hides_the_destination_and_its_facts() {
+        let mut world = crate::world::World::new(std::sync::Arc::new(crate::scene::avatar::AvatarLibrary::load()));
+        for event in crate::demo::events() {
+            world.apply(event);
+        }
+        let here = world.region_name();
+        assert!(!here.is_empty());
+        let point = glam::Vec3::new(128.0, 64.0, 30.0);
+        assert_eq!(banner_place(&world, "Lagune (128, 64, 30)"), ("Lagune".to_owned(), Some(point)));
+        assert_eq!(banner_place(&world, ""), (here.clone(), None));
+        let mut tiles = crate::ui::map_tiles::MapTiles::new();
+        let facts = PlaceFacts::gather(&mut world, &mut tiles, &here, Some(point), true);
+        assert_eq!(facts.position, "128, 64, 30");
+        assert!(facts.pin.is_some());
+
+        world.rlva.configure(true);
+        assert!(world.rlva.receive(&prototype_net::ChatMessage {
+            from_name: "Fixture".into(),
+            source_id: uuid::Uuid::from_u128(99),
+            owner_id: uuid::Uuid::nil(),
+            source_type: prototype_net::ChatSourceType::Object,
+            chat_type: prototype_net::ChatType::OwnerSay,
+            region: None,
+            position: glam::Vec3::ZERO,
+            message: "@showloc=n".into(),
+        }));
+        for dest in ["Lagune (128, 64, 30)", "Lagune", ""] {
+            let (name, arrival) = banner_place(&world, dest);
+            assert!(!name.contains("Lagune") && name != here && !name.is_empty(), "{dest:?}: {name}");
+            assert_eq!(arrival, None);
+        }
+        let facts = PlaceFacts::gather(&mut world, &mut tiles, &here, Some(point), true);
+        assert!(facts.position.is_empty() && facts.maturity.is_empty());
+        assert!(facts.residents.is_none() && facts.tile.is_none() && facts.pin.is_none());
+    }
+
+    #[test]
+    fn the_teleport_screen_paints_in_its_first_frame() {
+        // the loading screen hands over to it at full opacity: a frame
+        // without it shows the world between the two
+        let ctx = egui::Context::default();
+        let p = crate::theme::Theme::default().palette();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| {
+                teleport_overlay(
+                    ui.ctx(),
+                    &p,
+                    None,
+                    None,
+                    "Loading",
+                    "Lagune",
+                    "Scene",
+                    Some(1.0),
+                    1.0,
+                    &Place::default(),
+                    false,
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let painted = output.shapes.iter().any(|clipped| match &clipped.shape {
+            Shape::Text(text) => text.galley.text() == "Lagune",
+            _ => false,
+        });
+        assert!(painted, "the region name is not painted in the first frame");
+    }
+
+    #[test]
+    fn the_teleport_screen_cancel_button_takes_the_click() {
+        // the screen's own area swallows clicks over the whole window: the
+        // button must stay above it, also after a click on the screen
+        let ctx = egui::Context::default();
+        let p = crate::theme::Theme::default().palette();
+        let label = prototype_i18n::tr!("common-cancel");
+        let frame = |events: Vec<egui::Event>| {
+            let mut pressed = false;
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 900.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    pressed = teleport_overlay(
+                        ui.ctx(),
+                        &p,
+                        None,
+                        None,
+                        "Teleport",
+                        "Lagune",
+                        "Scene",
+                        Some(0.2),
+                        1.0,
+                        &Place::default(),
+                        true,
+                    )
+                },
+            );
+            output.textures_delta.clear();
+            let at = output.shapes.iter().find_map(|clipped| match &clipped.shape {
+                Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect().center()),
+                _ => None,
+            });
+            (pressed, at)
+        };
+        let click = |at: Pos2| {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            [
+                vec![egui::Event::PointerMoved(at)],
+                vec![button(true)],
+                vec![button(false)],
+                Vec::new(),
+            ]
+        };
+        frame(Vec::new());
+        let (_, at) = frame(Vec::new());
+        let at = at.expect("the Cancel button is painted");
+        // a click on the screen first, away from the button
+        for events in click(Pos2::new(600.0, 450.0)) {
+            assert!(!frame(events).0);
+        }
+        let pressed = click(at).into_iter().any(|events| frame(events).0);
+        assert!(pressed, "the click on Cancel reached the screen behind it");
+    }
+}

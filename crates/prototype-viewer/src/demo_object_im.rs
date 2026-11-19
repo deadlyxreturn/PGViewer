@@ -1,0 +1,127 @@
+//! PROTOTYPE_DEMO_OBJECT_IM=off|region|parcel|strict: objects' messages from
+//! near and far (`world/object_im_filter.rs`), with the filter set for this
+//! run only: `off`, on for the region, on for the parcel, or on for the
+//! parcel with friends' objects blocked too. Seven messages reach nearby
+//! chat from frame 700, each saying when it should be hidden; the log has
+//! one "dropped" line for each hidden one. At frame 910 the grid says an
+//! object of ours was returned to our inventory; `,returns` after the mode
+//! hides that message for the run (FSDisableReturnObjectNotification).
+
+use crate::world::object_im_filter::{Scope, Settings};
+use prototype_net::{ChatMessage, ChatSourceType, ChatType, InstantMessage, NetEvent};
+use glam::Vec3;
+use uuid::Uuid;
+
+/// The filter of this run, if the scenario is on.
+pub fn settings() -> Option<Settings> {
+    let value = std::env::var("PROTOTYPE_DEMO_OBJECT_IM").ok()?;
+    let mode = value.split(',').next().unwrap_or_default();
+    let on = |scope, allow_friends| Settings {
+        on: true,
+        scope,
+        allow_friends,
+    };
+    Some(match mode.trim() {
+        "off" => Settings::default(),
+        "parcel" => on(Scope::Parcel, true),
+        "strict" => on(Scope::Parcel, false),
+        _ => on(Scope::Region, true),
+    })
+}
+
+/// `,returns`: the return message hidden for the run.
+pub fn hide_returns() -> bool {
+    std::env::var("PROTOTYPE_DEMO_OBJECT_IM").is_ok_and(|v| v.split(',').skip(1).any(|w| w.trim() == "returns"))
+}
+
+/// An owner who is neither us nor a friend.
+const STRANGER: Uuid = Uuid::from_u128(0x0B1E_C700_0000_0000_0000_0000_0000_0001);
+
+fn object(n: u128) -> Uuid {
+    Uuid::from_u128(0x0B1E_C700_0000_0000_0000_0000_0000_0100 | n)
+}
+
+fn name(n: u128) -> String {
+    prototype_i18n::tr!("demo-object-im-name", n = n.to_string()).to_string()
+}
+
+/// llInstantMessage from `owner`'s object at `location` ("Region/x/y/z").
+fn im(n: u128, owner: Uuid, agent: Uuid, location: &str, text: &str) -> NetEvent {
+    let mut bucket = location.as_bytes().to_vec();
+    bucket.push(0);
+    NetEvent::InstantMessage(InstantMessage {
+        from_agent_id: owner,
+        from_name: name(n),
+        to_agent_id: agent,
+        dialog: 19,
+        session_id: object(n),
+        message: text.into(),
+        offline: false,
+        from_group: false,
+        binary_bucket: bucket,
+        timestamp: 0,
+    })
+}
+
+/// The events of `frame`. The demo parcel is the square 64..192 m.
+pub fn events(frame: u64, agent: Uuid) -> Vec<NetEvent> {
+    let here = prototype_i18n::tr!("common-prototype-demo");
+    let ev = match frame {
+        700 => im(
+            1,
+            STRANGER,
+            agent,
+            "Far Away/128/128/25",
+            prototype_i18n::tr!("demo-object-im-other-region"),
+        ),
+        730 => im(2, agent, agent, "Far Away/30/40/25", prototype_i18n::tr!("demo-object-im-own")),
+        760 => im(
+            3,
+            super::DEMO_FRIEND,
+            agent,
+            "Far Away/60/90/25",
+            prototype_i18n::tr!("demo-object-im-friend"),
+        ),
+        790 => im(
+            4,
+            STRANGER,
+            agent,
+            &format!("{here}/20/20/21"),
+            prototype_i18n::tr!("demo-object-im-other-parcel"),
+        ),
+        820 => im(
+            5,
+            STRANGER,
+            agent,
+            &format!("{here}/128/128/21"),
+            prototype_i18n::tr!("demo-object-im-this-parcel"),
+        ),
+        // llRegionSayTo from outside the parcel
+        850 => NetEvent::Chat(ChatMessage {
+            from_name: name(6),
+            source_id: object(6),
+            owner_id: STRANGER,
+            source_type: ChatSourceType::Object,
+            chat_type: ChatType::Other(9),
+            region: Some(crate::demo::HANDLE),
+            position: Vec3::new(230.0, 30.0, 21.0),
+            message: prototype_i18n::tr!("demo-object-im-say-to").into(),
+        }),
+        880 => im(7, STRANGER, agent, "", prototype_i18n::tr!("demo-object-im-no-location")),
+        // the grid's word, in English only, about an object of ours
+        910 => im(
+            8,
+            agent,
+            agent,
+            &format!("{here}/128/128/21"),
+            &format!(
+                "Your object '{}' has {} Lost and Found folder from parcel '{}' at {here} 128, 128 due to parcel auto return.",
+                name(8),
+                crate::world::object_im_filter::RETURNED,
+                prototype_i18n::tr!("common-prototype-plaza")
+            ),
+        ),
+        _ => return Vec::new(),
+    };
+    vec![ev]
+}

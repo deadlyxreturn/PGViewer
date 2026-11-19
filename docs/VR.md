@@ -1,0 +1,239 @@
+# Experimental VR scene viewing
+
+Click **VR View** in the toolbar and choose **First Person**, **Avatar Mode**, or **Flycam**.
+
+Keyboard and gamepad movement work while the headset view is active. VR hand
+controllers and in-headset menus are not implemented. No viewer UI, nameplates,
+worn HUDs, selection outlines or editing overlays appear in the headset.
+The desktop remains a left-eye mirror with an exit instruction.
+
+## Platform status
+
+| Platform | Graphics binding | Build/automated evidence | Human headset evidence |
+|---|---|---|---|
+| Linux | Vulkan / `XR_KHR_vulkan_enable2` | Full local checks pass | Quest 3, WiVRn 26.9, RTX 3090: stereo, tracking, horizon, repeated entry/Esc exit, restoration, mirror and hint validated |
+| Windows x64 | Vulkan / `XR_KHR_vulkan_enable2` | Native strict Clippy, viewer/sample builds and shared VR tests pass | Maintainer, 2026-11-01: RTX 4090, Virtual Desktop's runtime (VDXR): stereo, tracking, first-person and camera-position entry, repeated entry/Esc exit, restart into VR |
+| macOS Apple Silicon | Metal / `XR_KHR_metal_enable` | Native binding implemented; existing macOS CI and runtime tests pending | No Mac/headset available in this session; no headset or simulator result claimed |
+
+No platform status means every OpenXR headset works. The runtime must expose the
+required graphics binding, device, stereo views and eye image format. Build, unit
+tests, simulator rendering and physical headset streaming are separate gates.
+
+## Common requirements
+
+- A GPU/driver meeting Prototype's existing renderer feature/resource requirements.
+  The runtime-selected GPU must also be suitable for the desktop window.
+- A configured headset runtime. The published Windows viewer has the Khronos OpenXR
+  loader built in (`xr-static-loader`, CMake needed to build it; a local build
+  without it loads the runtime's loader); Linux uses the distribution's loader package (WiVRn and Monado
+  install it), macOS the installed loader. VR is set up when
+  Prototype starts, and only once VR has been used (Preferences › Camera › VR ›
+  "Set up VR at startup", off by default: loading a runtime at every start
+  crashed PCs that never use VR, #2309). Until then, or with the headset
+  connected later, the headset button offers "Restart in VR" (the viewer
+  restarts with `--vr`, enters VR once the world shows and turns the setting
+  on). VR is optional: without a runtime, the viewer starts as usual.
+- Head-mounted display, two-view `PRIMARY_STEREO`, `LOCAL` and `VIEW` reference
+  spaces, opaque composition and the selected RGBA8/BGRA8 eye format.
+- Eye images supporting color attachment and sampling; Vulkan also uses
+  transfer-source access. Per-eye dimensions are configurable in Preferences > VR.
+
+Attaching a headset without a restart, runtime restart/disconnect recovery, broader stereo
+visual validation and performance/memory benchmarks remain unfinished. A restart
+may be needed after runtime loss. Esc is not a global shortcut and controllers
+cannot exit VR. Two eye backends add GPU time and memory; no frame-rate guarantee
+is made. No standalone Android/visionOS Prototype application is included.
+
+## Linux
+
+Install the distribution OpenXR loader (`libopenxr_loader.so.1`; WiVRn and Monado
+depend on it) and a compatible Vulkan 1.3 runtime. Start
+WiVRn/server and connect the headset before launching, or use "Restart in VR".
+Use the runtime's supported active-runtime registration. Normal use needs no demo
+variable. Other Linux runtimes/headsets/GPUs remain unvalidated.
+
+## Windows
+
+See [Windows VR setup and maintainer checklist](VR_WINDOWS.md). Select a runtime
+supporting Vulkan-enable2 (nothing else to install).
+Start with the two-session `xr_spike` sample, then test the offline viewer. The
+redundant dedicated Windows workflow was removed following maintainer feedback;
+existing Windows CI covers compilation. Headset tests use a local dev build.
+
+## macOS: runtime investigation and native Metal path
+
+Prototype retains its Metal renderer. It does not switch to Vulkan/MoltenVK. The
+OpenXR binding queries the runtime's Metal device, checks adapter identity, binds
+the exact wgpu command queue, and imports retained runtime-owned `MTLTexture`
+images. Session teardown keeps the queue/images alive until rendering completes.
+`openxr 0.22` provides raw Metal extension bindings but no typed Metal graphics
+adapter; the small private adapter in `xr_metal.rs` uses those existing bindings.
+
+Sources checked on 2026-11-02:
+
+| Source | What it establishes | What it does not establish |
+|---|---|---|
+| [Khronos Metal binding](https://registry.khronos.org/OpenXR/specs/1.1/man/html/XR_KHR_metal_enable.html) | Ratified native Metal device/queue/swapchain interface | Availability or quality of a particular headset runtime |
+| [Khronos runtime inventory](https://github.khronos.org/OpenXR-Inventory/runtime_extension_support.html) | Meta XR Simulator on macOS advertises Metal; a simulator route exists | Physical headset streaming or Prototype compatibility |
+| [OXRSys](https://github.com/demonixis/oxrsys/tree/82ee9ff58f26dcbe3d75f94de4357a2df1906b3e) and its [support matrix](https://github.com/demonixis/oxrsys/blob/82ee9ff58f26dcbe3d75f94de4357a2df1906b3e/docs/support-matrix.md) | Experimental macOS runtime source with Metal and headset-streaming clients | Prototype launch, stereo correctness or physical-device qualification; its matrix distinguishes these from builds |
+| [WiVRn macOS fork](https://github.com/kzahel/wivrn-macos/tree/0ed2634ad917749b58e23a58b452299d0b27b4ab) | Experimental Apple Silicon host packaging with a native Metal frame probe and Quest route | Upstream WiVRn macOS support or an Prototype headset test |
+| [Upstream Monado](https://monado.freedesktop.org/) | Published platform coverage differs from these experimental forks | An upstream production-ready macOS installation |
+
+These are candidate development runtimes, not Prototype-certified products. It
+would be inaccurate to say no macOS OpenXR runtime exists; it would also be
+inaccurate to infer physical headset compatibility from these repositories.
+Windows runtime names are not macOS installation instructions.
+
+### Mac setup and validation
+
+1. Use Prototype's normal Apple Silicon/Xcode environment. Install a candidate
+   runtime, its matching headset client if needed, and an arm64 Khronos OpenXR
+   loader. Runtime registration remains the runtime provider's responsibility.
+   Meta's [simulator setup](https://developers.meta.com/vr/documentation/native/xrsim-getting-started/)
+   provides a separate desktop-simulator route; record simulator results as such.
+2. If the loader is not discoverable as `libopenxr_loader.dylib`, set
+   `PROTOTYPE_OPENXR_LOADER` to its absolute installed path. For a development
+   runtime, `XR_RUNTIME_JSON` may select its manifest. No loader/runtime is bundled.
+3. Validate the runtime independently with Khronos `hello_xr -g Metal`. Prototype's
+   `xr_spike` example remains a Vulkan-only Linux/Windows interoperability test.
+4. Start/connect the runtime and headset, then run the timed full-scene offline
+   test (environment values below are examples of controls, not installed paths):
+
+   ```sh
+   PROTOTYPE_DEMO=1 PROTOTYPE_DEMO_XR_WORLD=1 cargo run -p prototype-viewer -- --title "Test vr-scene-view macOS"
+   ```
+
+   This enters after frame 600 and submits for about 15 seconds. Then test manual
+   toolbar entry/Esc exit with `PROTOTYPE_DEMO=1` and no `PROTOTYPE_DEMO_XR_WORLD`.
+5. Record Mac/GPU, OS, runtime commit/version, loader, simulator/headset/client,
+   stereo/depth/tracking, horizon leveling from tilted desktop/headset entry,
+   repeated entry/Esc exit, desktop restoration, mirror/hint, focus, resizing and
+   shutdown. Test unavailable runtime and disconnect separately. Only a human
+   logs in for any later live-grid validation.
+
+**Pending:** macOS CI compilation and Metal pipeline/demo checks, simulator
+submission, physical headset streaming, runtime/driver resource-lifetime
+validation, latency/performance and recovery. Maintainer review must decide
+whether the experimental runtime ecosystem is sufficient for platform parity.
+
+## Dependencies and footprint
+
+The new runtime dependency is `openxr 0.22.0`, with `openxr-sys 0.14.0` and
+`libloading 0.9.0`; the older libloading remains for existing users. Licenses are
+MIT/Apache-2.0 and ISC. macOS directly reuses `objc2 0.6.5` and the existing
+`objc2-metal 0.3.2` bindings already used by wgpu; no additional package versions
+or Metal/Vulkan translation library are added for the Mac path.
+
+No VR engine/framework, runtime, streaming stack, headset client or recording
+software is bundled. The system loader/runtime are external requirements. The
+interoperability example is not part of the viewer executable. Binary-size,
+GPU-memory and frame-time differences have not been quantified.
+
+## Recording
+
+The desktop mirror samples the submitted left eye at up to 30 FPS, with
+letterboxing, rather than drawing a third world view or reading it back to the
+CPU. Capture the Prototype window with OBS (PipeWire on Linux/Wayland; the native
+window source on other systems), using hardware encoding where available. The
+exit instruction is included. Capture/encoding adds overhead and the mirror
+cannot show headset streaming/compositor-only artifacts.
+
+## Movement and camera preferences
+
+The toolbar VR popup enters First Person, Avatar Mode, or Flycam. The
+gamepad view button cycles First Person → Avatar Mode → Flycam on desktop and in VR.
+
+Avatar mode reuses the normal gamepad camera: horizontal orbit, vertical pan,
+zoom, focus height and target-travel animation. Intentional controller orbit
+turns the view around the avatar. Starting a movement or camera input samples
+the headset for a gentle horizontal translation that preserves camera height
+and zoom. Continuing to hold that input leaves the sampled framing goal alone. Bumper target selection uses the normal
+move through space and timing, with a VR destination/view heading that avoids
+the automatic turn toward the other avatar's front. People and bumper target selection use the
+same tracked focus point. Arrival corrects framing by translation if the
+headset moved during travel. Zoom remains parallel to
+the ground and does not lower the camera during its settling frames.
+
+Flycam follows the headset's physical movement at 1:1 scale. Its steering pivot
+moves with the head, and forward travel follows full physical gaze, including
+looking up or down. Artificial stick pitch and roll remain disabled.
+
+First-person entry aligns the current tracked headset height with the avatar’s
+eye height. Walking follows horizontal gaze. Physical head movement remains
+1:1 and excludes animated eye offsets and camera shake. The avatar follows
+the head's ground-plane projection through the normal walking controls: it
+starts outside a 0.18 m horizontal offset and aims to stop inside 0.05 m. The separate
+thresholds prevent repeated starts and stops from small head motions. Manual
+locomotion takes priority; following does not enable running, flight or jumping.
+Flight and falls suspend automatic walking. Vertical avatar movement carries the
+headset rig without clearing its horizontal compensation.
+Body catch-up does not push the camera farther away from the avatar. Its
+arrival controller latches the physical world goal, brakes before delayed
+movement overshoots, and waits for the stopping response before retrying a
+shortfall even if the headset holds still. The avatar faces horizontal headset
+gaze and uses forward, backward and sideways walk controls to catch up.
+
+The body/origin separation follows the head-projected body model described by
+[Unity XR Body Transformer](https://docs.unity3d.com/Packages/com.unity.xr.interaction.toolkit@3.2/manual/xr-body-transformer.html)
+and its [locomotion architecture](https://docs.unity3d.com/Packages/com.unity.xr.interaction.toolkit@3.2/manual/locomotion.html).
+Walking-speed catch-up and the 0.18/0.05 m hysteresis are Prototype-specific comfort
+choices, not claimed toolkit defaults.
+
+Keyboard controls use the existing movement bindings. In First person and
+Flycam, lateral keys turn when mouse look is off and strafe when it is on.
+Jump and crouch use the normal avatar actions in First person and Avatar mode.
+In Flycam, those keys raise and lower the camera vertically.
+
+The Mouselook shortcut (M by default) and the gamepad view-cycle button
+switch the active VR camera. Choose the entry mode from the VR View toolbar menu. With mouse look
+enabled, horizontal mouse motion orbits the avatar in Avatar mode.
+
+Gamepad input follows headset session focus. An engaged headset retains normal
+frame pacing and scene resources even when the desktop mirror loses focus or
+is minimized. Physical tracking and stereo eye separation remain active.
+
+Mouse look is off by default. When enabled it turns horizontally only, and its
+warning icon explains that it may cause discomfort.
+
+Gamma (0.5–2.5) and Colour vibrancy (0–2) adjust the headset image live.
+Gamma and vibrancy default to 1.0. Saved adjustments are retained. The desktop mirror uses the unadjusted eye image.
+
+The automatic resolution choice displays the dimensions supplied by the runtime
+after the default 1600-per-side cap and device limits. The 2160 × 2160,
+2560 × 2560 and custom sizes are explicit alternatives. A saved 1600 × 1600
+selection remains available as a custom size. Restart the viewer after changing it.
+The runtime and GPU texture limits may reduce the requested dimensions.
+
+Headset validation: check native Avatar orbit and vertical pan, then framing
+while moving, using camera controls,
+changing avatar targets with the bumpers and zooming. Zoom must retain height, and the rig must
+not rotate to face a target. In Flycam, move physically 30 cm sideways and check
+1:1 view displacement and steering about the new head position. In First
+person, step outside the follow threshold and stop: the avatar should walk
+toward the head without dragging the view, then stop within the inner band.
+Check manual takeover, loss/regaining of headset focus, physical head turns,
+walking/running, seated views, mode cycling, mouse look, Escape exit and each
+resolution after restarting.
+
+
+While the headset is engaged, keyboard input is reserved for movement, gestures,
+the bound Mouselook shortcut that cycles VR modes, and Escape to exit. Desktop
+shortcuts and chat typing are suspended during VR because a headset UI has not
+yet been implemented. This prevents accidental input from opening invisible
+windows or causing confusing interactions.
+
+VR keeps the selected mode over creator seat cameras, scripted FollowCam and
+forced mouselook. A turret or combat seat that expects forced mouselook may
+therefore receive no mouselook mouse-button control events in Avatar or Flycam.
+First Person is the appropriate mode for features that require mouselook.
+
+Valid inferred eye poses continue rendering after initial anchoring. Body following
+and automatic framing pause while the head is untracked and resume on fresh
+tracked feedback. Initial anchoring and explicit first-person recentering require
+fully tracked poses.
+
+Older enabled joystick profiles assigned to gamepads are migrated once into the
+Gamepad page. Saved native axes, gains and button assignments are retained.
+Unclassified profiles remain pending across saves until the saved device appears.
+The Linux input-layout choice can correct X/Y for an unrecognized input driver;
+controller style selects the displayed button labels.

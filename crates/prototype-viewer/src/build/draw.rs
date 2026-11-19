@@ -1,0 +1,323 @@
+//! Drawing 3D handles and guides with egui over the scene: lines clipped at
+//! the near plane, shaded triangles sorted back to front, labels.
+
+use super::geom::Cam;
+use crate::theme::Palette;
+use prototype_render::WORLD_OVERLAY_NEAR_W;
+use egui::{Color32, FontId, Pos2, Shape, Stroke};
+use glam::{Quat, Vec3};
+
+pub struct Painter3d<'a> {
+    pub painter: egui::Painter,
+    pub cam: &'a Cam,
+    /// Colors of the theme: handles and guides take them like a window does.
+    pub pal: Palette,
+    /// Triangles waiting for the depth sort: (depth, points, color).
+    tris: Vec<(f32, [Pos2; 3], Color32)>,
+}
+
+pub fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(
+        (r.clamp(0.0, 1.0) * 255.0) as u8,
+        (g.clamp(0.0, 1.0) * 255.0) as u8,
+        (b.clamp(0.0, 1.0) * 255.0) as u8,
+        (a.clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
+/// Color of a grid axis, shared by the manipulators and the X / Y / Z fields
+/// of the build window: the red, green and blue of the palette. Z has its
+/// own colour, which the interface accent leaves alone (#3657).
+pub fn axis_color(p: &Palette, axis: usize) -> Color32 {
+    [p.danger, p.success, p.axis_z][axis.min(2)]
+}
+
+/// Same color, alpha multiplied.
+pub fn fade(c: Color32, a: f32) -> Color32 {
+    let [r, g, b, ca] = c.to_srgba_unmultiplied();
+    Color32::from_rgba_unmultiplied(r, g, b, (ca as f32 * a.clamp(0.0, 1.0)) as u8)
+}
+
+fn shade(c: Color32, k: f32) -> Color32 {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    let f = |v: u8| ((v as f32) * k).clamp(0.0, 255.0) as u8;
+    Color32::from_rgba_unmultiplied(f(r), f(g), f(b), a)
+}
+
+impl<'a> Painter3d<'a> {
+    pub fn new(painter: egui::Painter, cam: &'a Cam, pal: Palette) -> Self {
+        Painter3d {
+            painter,
+            cam,
+            pal,
+            tris: Vec::new(),
+        }
+    }
+
+    fn clip_segment(&self, a: Vec3, b: Vec3) -> Option<(Pos2, Pos2)> {
+        let [ca, cb] = prototype_render::clip_world_line(self.cam.clip(a), self.cam.clip(b))?;
+        Some((self.cam.clip_to_screen(ca), self.cam.clip_to_screen(cb)))
+    }
+
+    pub fn line(&self, a: Vec3, b: Vec3, color: Color32, width: f32) {
+        if let Some((pa, pb)) = self.clip_segment(a, b) {
+            self.painter.line_segment([pa, pb], Stroke::new(width, color));
+        }
+    }
+
+    /// Line whose color goes from `ca` to `cb` (split in a few pieces).
+    pub fn line_gradient(&self, a: Vec3, b: Vec3, ca: Color32, cb: Color32, width: f32) {
+        const N: usize = 6;
+        for i in 0..N {
+            let (t0, t1) = (i as f32 / N as f32, (i + 1) as f32 / N as f32);
+            let c = lerp_color(ca, cb, (t0 + t1) * 0.5);
+            self.line(a.lerp(b, t0), a.lerp(b, t1), c, width);
+        }
+    }
+
+    /// Lines with the LL snap guide passes: a dark shadow offset by one pixel,
+    /// then the line.
+    pub fn guide_line(&self, a: Vec3, b: Vec3, color: Color32, opacity: f32) {
+        if let Some((pa, pb)) = self.clip_segment(a, b) {
+            let off = egui::vec2(1.0, 1.0) / self.cam.ppp;
+            self.painter
+                .line_segment([pa + off, pb + off], Stroke::new(2.0, rgba(0.0, 0.0, 0.0, 0.31 * opacity)));
+            self.painter.line_segment([pa, pb], Stroke::new(1.0, fade(color, opacity)));
+        }
+    }
+
+    /// Corners of a small mark (a stretch handle, the readout): the theme's.
+    pub fn mark_radius(&self) -> egui::CornerRadius {
+        crate::ui::widgets::inner_radius(&self.painter.ctx().global_style().visuals)
+    }
+
+    /// Line over a darker, wider one: a pale handle stays readable in front
+    /// of a bright sky or a white wall.
+    pub fn line_cased(&self, a: Vec3, b: Vec3, color: Color32, width: f32) {
+        if let Some((pa, pb)) = self.clip_segment(a, b) {
+            let casing = fade(self.pal.navy, 0.35 * color.a() as f32 / 255.0);
+            self.painter.line_segment([pa, pb], Stroke::new(width + 2.0, casing));
+            self.painter.line_segment([pa, pb], Stroke::new(width, color));
+        }
+    }
+
+    /// One triangle, flat shaded by its facing (`normal` in world space).
+    pub fn tri(&mut self, a: Vec3, b: Vec3, c: Vec3, normal: Vec3, color: Color32) {
+        let to_eye = (self.cam.eye - (a + b + c) / 3.0).normalize_or_zero();
+        let light = 0.55 + 0.45 * normal.normalize_or_zero().dot(to_eye).abs();
+        self.tri_plain(a, b, c, shade(color, light));
+    }
+
+    /// One triangle in its own color, without shading: the marks of the
+    /// theme are flat.
+    pub fn tri_plain(&mut self, a: Vec3, b: Vec3, c: Vec3, color: Color32) {
+        let (ca, cb, cc) = (self.cam.clip(a), self.cam.clip(b), self.cam.clip(c));
+        if ca.w < WORLD_OVERLAY_NEAR_W || cb.w < WORLD_OVERLAY_NEAR_W || cc.w < WORLD_OVERLAY_NEAR_W {
+            return;
+        }
+        let depth = (ca.w + cb.w + cc.w) / 3.0;
+        self.tris.push((
+            depth,
+            [
+                self.cam.clip_to_screen(ca),
+                self.cam.clip_to_screen(cb),
+                self.cam.clip_to_screen(cc),
+            ],
+            color,
+        ));
+    }
+
+    /// A cone along `dir` from its base center (radius `r`, height `h`), in
+    /// one plain color: its outline alone shows, whatever the view angle.
+    pub fn cone(&mut self, base: Vec3, dir: Vec3, r: f32, h: f32, color: Color32) {
+        const SIDES: usize = 16;
+        let d = dir.normalize_or_zero();
+        let u = d.any_orthonormal_vector();
+        let v = d.cross(u);
+        let apex = base + d * h;
+        let ring: Vec<Vec3> = (0..SIDES)
+            .map(|i| {
+                let a = i as f32 / SIDES as f32 * std::f32::consts::TAU;
+                base + (u * a.cos() + v * a.sin()) * r
+            })
+            .collect();
+        for i in 0..SIDES {
+            let (p, q) = (ring[i], ring[(i + 1) % SIDES]);
+            self.tri_plain(p, q, apex, color);
+            self.tri_plain(q, p, base, color);
+        }
+    }
+
+    /// A square of `size` pixels facing the screen, centered on a world
+    /// point: a stretch handle.
+    pub fn square(&self, center: Vec3, size: f32, fill: Color32, outline: Stroke) {
+        let Some(s) = self.cam.project(center) else {
+            return;
+        };
+        let rect = egui::Rect::from_center_size(s, egui::Vec2::splat(size));
+        self.painter
+            .rect(rect, self.mark_radius(), fill, outline, egui::StrokeKind::Outside);
+    }
+
+    /// An oriented box.
+    pub fn cube(&mut self, center: Vec3, rot: Quat, half: Vec3, color: Color32) {
+        let c = |x: f32, y: f32, z: f32| center + rot * (half * Vec3::new(x, y, z));
+        for axis in 0..3 {
+            for s in [-1.0f32, 1.0] {
+                let mut n = Vec3::ZERO;
+                n[axis] = s;
+                let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+                let corner = |a: f32, b: f32| {
+                    let mut p = Vec3::ZERO;
+                    p[axis] = s;
+                    p[u] = a;
+                    p[v] = b;
+                    c(p.x, p.y, p.z)
+                };
+                let (p0, p1, p2, p3) = (corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0));
+                let nw = rot * n;
+                self.tri(p0, p1, p2, nw, color);
+                self.tri(p0, p2, p3, nw, color);
+            }
+        }
+    }
+
+    /// A flat quad (two triangles).
+    pub fn quad(&mut self, p: [Vec3; 4], color: Color32) {
+        let n = (p[1] - p[0]).cross(p[2] - p[0]);
+        self.tri(p[0], p[1], p[2], n, color);
+        self.tri(p[0], p[2], p[3], n, color);
+    }
+
+    /// Paint the queued triangles, farthest first.
+    pub fn flush(&mut self) {
+        self.tris.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut mesh = egui::Mesh::default();
+        for (_, p, c) in self.tris.drain(..) {
+            let i = mesh.vertices.len() as u32;
+            for q in p {
+                mesh.colored_vertex(q, c);
+            }
+            mesh.add_triangle(i, i + 1, i + 2);
+        }
+        if !mesh.vertices.is_empty() {
+            self.painter.add(Shape::mesh(mesh));
+        }
+    }
+
+    /// Label with a drop shadow, centered on a world point.
+    pub fn text(&self, p: Vec3, text: &str, size: f32, color: Color32) {
+        let Some(s) = self.cam.project(p) else {
+            return;
+        };
+        let font = FontId::proportional(size);
+        self.painter.text(
+            s + egui::vec2(1.0, 1.0),
+            egui::Align2::CENTER_CENTER,
+            text,
+            font.clone(),
+            fade(Color32::BLACK, color.a() as f32 / 255.0),
+        );
+        self.painter.text(s, egui::Align2::CENTER_CENTER, text, font, color);
+    }
+
+    /// LLManip::renderTickValue: integer part large, fraction and unit small.
+    pub fn tick_value(&self, p: Vec3, value: f32, suffix: &str, color: Color32) {
+        let Some(s) = self.cam.project(p) else {
+            return;
+        };
+        let neg = value < 0.0;
+        let v = value.abs();
+        let whole = v.floor();
+        let frac = ((v - whole) * 100.0).round() as i32;
+        let (whole, frac) = if frac >= 100 { (whole + 1.0, 0) } else { (whole, frac) };
+        let big = format!("{}{}", if neg { "-" } else { "" }, whole as i64);
+        let small = if frac != 0 {
+            format!(".{frac:02}{suffix}")
+        } else {
+            suffix.to_owned()
+        };
+        let shadow = fade(Color32::BLACK, color.a() as f32 / 255.0);
+        let (fb, fs) = (FontId::proportional(13.0), FontId::proportional(10.0));
+        for (off, col) in [(egui::vec2(1.0, 1.0), shadow), (egui::Vec2::ZERO, color)] {
+            self.painter.text(s + off, egui::Align2::RIGHT_BOTTOM, &big, fb.clone(), col);
+            self.painter
+                .text(s + off + egui::vec2(0.0, -1.0), egui::Align2::LEFT_BOTTOM, &small, fs.clone(), col);
+        }
+    }
+}
+
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let (a, b) = (a.to_srgba_unmultiplied(), b.to_srgba_unmultiplied());
+    let f = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t) as u8;
+    Color32::from_rgba_unmultiplied(f(0), f(1), f(2), f(3))
+}
+
+/// Segments of each circle of `light_radius_circles`.
+pub const CIRCLE_SEGMENTS: usize = 48;
+
+/// Three great circles of a sphere (around X, Y and Z), as segments.
+pub fn light_radius_circles(center: Vec3, radius: f32) -> impl Iterator<Item = [Vec3; 2]> {
+    let step = std::f32::consts::TAU / CIRCLE_SEGMENTS as f32;
+    [(Vec3::Y, Vec3::Z), (Vec3::Z, Vec3::X), (Vec3::X, Vec3::Y)]
+        .into_iter()
+        .flat_map(move |(u, v)| {
+            let at = move |i: usize| {
+                let (s, c) = (i as f32 * step).sin_cos();
+                center + (u * c + v * s) * radius
+            };
+            (0..CIRCLE_SEGMENTS).map(move |i| [at(i), at(i + 1)])
+        })
+}
+
+/// A reflection probe's volume (LLReflectionMap::update): a box probe
+/// fills its prim's oriented box; a sphere probe reaches half the prim's
+/// X scale.
+pub fn probe_volume_edges(pos: Vec3, rot: glam::Quat, scale: Vec3, boxed: bool) -> Vec<[Vec3; 2]> {
+    if boxed {
+        let half = scale * 0.5;
+        let corner = |x: f32, y: f32, z: f32| pos + rot * (half * Vec3::new(x, y, z));
+        let mut out = Vec::with_capacity(12);
+        for a in [-1.0f32, 1.0] {
+            for b in [-1.0f32, 1.0] {
+                out.push([corner(-1.0, a, b), corner(1.0, a, b)]);
+                out.push([corner(a, -1.0, b), corner(a, 1.0, b)]);
+                out.push([corner(a, b, -1.0), corner(a, b, 1.0)]);
+            }
+        }
+        out
+    } else {
+        light_radius_circles(pos, scale.x * 0.5).collect()
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    #[test]
+    fn light_radius_circles_stay_on_the_sphere_and_close() {
+        let c = Vec3::new(1.0, 2.0, 3.0);
+        let segments: Vec<_> = light_radius_circles(c, 4.0).collect();
+        assert_eq!(segments.len(), 3 * CIRCLE_SEGMENTS);
+        for circle in segments.chunks(CIRCLE_SEGMENTS) {
+            assert!(circle[0][0].abs_diff_eq(circle[CIRCLE_SEGMENTS - 1][1], 1e-4));
+            assert!(
+                circle
+                    .iter()
+                    .all(|[a, b]| (a.distance(c) - 4.0).abs() < 1e-4 && (b.distance(c) - 4.0).abs() < 1e-4)
+            );
+        }
+    }
+
+    #[test]
+    fn probe_volumes_follow_the_box_or_half_the_x_scale() {
+        let rot = glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let edges = probe_volume_edges(Vec3::ZERO, rot, Vec3::new(4.0, 2.0, 6.0), true);
+        assert_eq!(edges.len(), 12);
+        let far = edges.iter().flatten().fold(Vec3::ZERO, |m, p| m.max(p.abs()));
+        assert!(far.abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-4), "turned box: {far}");
+        let sphere = probe_volume_edges(Vec3::ZERO, rot, Vec3::new(10.0, 2.0, 2.0), false);
+        assert!(sphere.iter().flatten().all(|p| (p.length() - 5.0).abs() < 1e-4));
+    }
+}

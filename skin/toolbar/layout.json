@@ -1,0 +1,39 @@
+{
+  "face_cap_px": 56,
+  "orbs": {
+    "conversations": 1,
+    "speak": 2,
+    "people": 5,
+    "inventory": 1,
+    "appearance": 2,
+    "move": 5,
+    "view": 2,
+    "worldmap": 1,
+    "minimap": 5,
+    "search": 2,
+    "places": 1,
+    "snapshot": 5,
+    "record": 1,
+    "gestures": 2,
+    "ao": 5,
+    "preferences": 1
+  },
+  "labels": {
+    "conversations": "Conversations",
+    "speak": "Speak",
+    "people": "People",
+    "inventory": "Inventory",
+    "appearance": "Appearance",
+    "move": "Move",
+    "view": "Camera",
+    "worldmap": "World Map",
+    "minimap": "Mini-map",
+    "search": "Search",
+    "places": "Places",
+    "snapshot": "Photo",
+    "record": "Record",
+    "gestures": "Gestures",
+    "ao": "AO",
+    "preferences": "Preferences"
+  }
+}

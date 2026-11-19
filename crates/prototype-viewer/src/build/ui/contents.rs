@@ -1,0 +1,550 @@
+//! Contents tab (LLPanelContents + LLPanelObjectInventory,
+//! indra/newview/llpanelcontents.cpp / llpanelobjectinventory.cpp,
+//! originally LGPL 2.1): the object's inventory with its buttons, filter,
+//! item menu, and inventory items dropped on it.
+
+use super::contents_selection;
+use crate::build::BuildTool;
+use crate::build::contents::{AT_LSL_TEXT, AT_NOTECARD};
+use crate::build::contents_drop;
+use crate::theme::Palette;
+use crate::ui::inventory::item_icon;
+use crate::ui::inventory::permissions::{self, Permissions};
+use crate::ui::{menu, widgets};
+use crate::world::World;
+use prototype_net::build::{TaskItem, perm};
+use egui::{RichText, Vec2};
+
+/// Localized item name (LLTaskInvFVBridge::getDisplayName). Permissions are
+/// displayed with the same compact suffix as the user's inventory.
+fn display_name(i: &TaskItem) -> String {
+    if i.asset_type == AT_LSL_TEXT && i.name.starts_with("New Script") {
+        i.name.replacen("New Script", prototype_i18n::tr!("common-new-script"), 1)
+    } else if i.asset_type == AT_NOTECARD && i.name.starts_with("New Notecard") {
+        i.name.replacen("New Notecard", prototype_i18n::tr!("common-new-notecard"), 1)
+    } else {
+        i.name.clone()
+    }
+}
+
+/// Keep Firestorm's restriction terms searchable after moving them to badges.
+fn searchable_name(i: &TaskItem) -> String {
+    let mut name = display_name(i);
+    for (bit, suffix) in [
+        (perm::COPY, prototype_i18n::tr!("build-ui-contents-no-copy")),
+        (perm::MODIFY, prototype_i18n::tr!("build-ui-contents-no-modify")),
+        (perm::TRANSFER, prototype_i18n::tr!("build-ui-contents-no-transfer")),
+    ] {
+        if i.owner_mask & bit == 0 {
+            name.push_str(suffix);
+        }
+    }
+    name
+}
+
+/// "Contents (N items)".
+fn root_label(n: usize) -> String {
+    prototype_i18n::tr!("contents-count", count = n)
+}
+
+pub fn show(ui: &mut egui::Ui, p: &Palette, tool: &mut BuildTool, world: &mut World) {
+    let Some(idx) = tool.contents_target(world) else { return };
+    let Some(object_id) = world.objects.get(idx).map(|o| o.full_id) else {
+        return;
+    };
+    tool.request_contents(world, idx, false);
+    let editable = tool.contents_editable(world, idx);
+    let single = tool.roots(world).len() == 1 || tool.sel_prims(world).len() == 1;
+    // LLPanelContents::getState: the Lua choice only where the object's region runs SLua
+    let lua_region = world
+        .objects
+        .get(idx)
+        .and_then(|o| world.regions.get(&o.key.region))
+        .is_some_and(|r| r.lua_scripts);
+    let lua = lua_region && tool.ui.new_script_lua.unwrap_or(true);
+
+    let font_size = if super::legacy::active(ui) { 11.0 } else { 12.0 };
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                editable && single,
+                egui::Button::new(RichText::new(prototype_i18n::tr!("common-new-script")).size(font_size)),
+            )
+            .clicked()
+        {
+            tool.new_script(world, idx, lua);
+        }
+        if lua_region {
+            new_script_language(ui, tool, lua);
+        }
+        if ui
+            .add_enabled(
+                editable && single,
+                egui::Button::new(RichText::new(prototype_i18n::tr!("build-ui-contents-reset-scripts")).size(font_size)),
+            )
+            .clicked()
+        {
+            tool.reset_scripts(world);
+        }
+        if ui
+            .button(RichText::new(prototype_i18n::tr!("build-ui-contents-refresh")).size(font_size))
+            .clicked()
+        {
+            tool.request_contents(world, idx, true);
+        }
+    });
+    ui.horizontal(|ui| {
+        // under New script, as floater_tools.xml stacks them; LLPanelContents::getState:
+        // only where the region has CreateTaskInventoryItem
+        if ui
+            .add_enabled(
+                editable && single && BuildTool::contents_create_cap(world, idx),
+                egui::Button::new(RichText::new(prototype_i18n::tr!("common-new-notecard")).size(font_size)),
+            )
+            .clicked()
+        {
+            tool.new_notecard(world, idx);
+        }
+        if ui
+            .button(RichText::new(prototype_i18n::tr!("common-rights")).size(font_size))
+            .on_hover_text(prototype_i18n::tr!("build-ui-contents-change-content-permissions"))
+            .clicked()
+        {
+            tool.ui.bulk_perms_open = !tool.ui.bulk_perms_open;
+        }
+        let response = permissions::rights_button(ui, p, &mut tool.ui.contents_rights, 26.0);
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::unique("contents-rights-button"), response.rect));
+        #[cfg(not(test))]
+        let _ = response;
+        let width = ui.available_width();
+        let search = crate::ui::widgets::search_text_edit(ui, p, &mut tool.ui.contents_filter, |edit| {
+            edit.hint_text(prototype_i18n::tr!("build-ui-contents-enter-filter-text"))
+                .desired_width(width)
+        });
+        #[cfg(test)]
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(egui::Id::unique("contents-search-field"), search.rect));
+        #[cfg(not(test))]
+        let _ = search;
+    });
+    let inv = tool.contents.objects.get(&object_id).cloned().unwrap_or_default();
+    let items: Vec<TaskItem> = inv.items.iter().filter(|i| !i.is_folder).cloned().collect();
+    let filter = tool.ui.contents_filter.trim().to_uppercase();
+    let mut list: Vec<&TaskItem> = items
+        .iter()
+        .filter(|i| filter.is_empty() || searchable_name(i).to_uppercase().contains(&filter))
+        .collect();
+    list.sort_by_key(|i| crate::natural_order::key(&i.name));
+    tool.ui
+        .contents_selection
+        .sync(object_id, list.iter().map(|it| it.item_id).collect(), ui.layer_id());
+    // Fill the bounded section viewport, including after a user resize.
+    // The list also accepts inventory drops; only its frame margins sit outside it.
+    let height = (ui.clip_rect().bottom() - ui.cursor().top() - 8.0).max(40.0);
+    let frame = egui::Frame::new()
+        .fill(p.field.gamma_multiply(0.72))
+        .corner_radius(ui.visuals().window_corner_radius)
+        .inner_margin(4);
+    let zone = frame.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        widgets::inventory_spacing(ui);
+        let background = ui.interact(
+            egui::Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), height)),
+            contents_selection::focus_id(object_id),
+            egui::Sense::click(),
+        );
+        if background.clicked() {
+            background.request_focus();
+            tool.ui.contents_selection.items.clear();
+        }
+        egui::ScrollArea::both()
+            .id_salt("task_contents_list")
+            .max_width(ui.available_width())
+            .max_height(height)
+            .min_scrolled_height((height - ui.spacing().scroll.allocated_width()).max(40.0))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let open_icon = if inv.loading && items.is_empty() {
+                    "folder-filled"
+                } else {
+                    "folder-open-filled"
+                };
+                let loading = inv.loading && inv.items.is_empty();
+                let row = ui.horizontal(|ui| {
+                    if let Some(t) = crate::ui::icons::global(open_icon) {
+                        ui.add(egui::Image::new(&t).fit_to_exact_size(Vec2::splat(16.0)).tint(p.violet_light));
+                    }
+                    let title = if loading {
+                        prototype_i18n::tr!("build-ui-contents-loading-contents").to_owned()
+                    } else {
+                        root_label(items.len())
+                    };
+                    ui.add(egui::Label::new(RichText::new(title).size(13.0).color(p.ink)).selectable(false));
+                });
+                // The root folder carries the whole contents to an inventory
+                // folder (LLTaskCategoryBridge::startDrag).
+                let root = ui
+                    .interact(
+                        row.response.rect,
+                        egui::Id::unique(("task_contents_root", object_id)),
+                        egui::Sense::click_and_drag(),
+                    )
+                    .on_hover_ui(|ui| {
+                        ui.label(prototype_i18n::tr!("common-object-contents"));
+                        ui.label(prototype_i18n::tr!("contents-root-drag-tip"));
+                    });
+                if !loading {
+                    crate::ui::inventory::task_drop::root_source(
+                        ui,
+                        &root,
+                        world,
+                        object_id,
+                        &items,
+                        crate::build::task_inventory::owned(world, object_id, tool.props.get(&object_id)),
+                    );
+                }
+                ui.indent("task_contents_items", |ui| {
+                    for item in list {
+                        item_row(ui, p, tool, world, idx, object_id, item, editable);
+                    }
+                });
+            });
+    });
+    if ui.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|pos| !zone.response.rect.contains(pos)))
+        && !egui::Popup::is_any_open(ui.ctx())
+    {
+        ui.memory_mut(|m| m.surrender_focus(contents_selection::focus_id(object_id)));
+    }
+    contents_selection::finish_if_hidden_or_blurred(ui.ctx(), tool, world);
+    if demo_enabled() {
+        ui.ctx().data_mut(|d| d.insert_temp(demo_zone_id(), zone.response.rect));
+    }
+    // egui's generic drop zone replaces the frame fill with a button color.
+    // Keep the inventory surface and show a border while cargo is over it.
+    if egui::DragAndDrop::has_any_payload(ui.ctx()) && zone.response.contains_pointer() {
+        let carried = crate::ui::inventory::drag::carried_ids(ui.ctx());
+        let ctrl = ui.input(|i| i.modifiers.ctrl);
+        // Items, folders and selections alike (LLTaskCategoryBridge::dragOrDrop),
+        // all of them accepted or none.
+        let check = carried
+            .as_ref()
+            .map(|ids| tool.ui.contents_drop.check(world, ids, idx, ctrl, contents_drop::Target::Panel));
+        let allowed = check.is_some_and(|c| c.is_ok());
+        ui.painter().rect_stroke(
+            zone.response.rect,
+            ui.visuals().window_corner_radius,
+            egui::Stroke::new(1.0, if allowed { p.violet_light } else { p.muted_dim }),
+            egui::StrokeKind::Inside,
+        );
+        if carried.is_some() {
+            crate::ui::inventory::drag::feedback(
+                ui.ctx(),
+                if allowed {
+                    egui::CursorIcon::Copy
+                } else {
+                    egui::CursorIcon::NotAllowed
+                },
+            );
+        }
+        if let Some(ids) = carried
+            && ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary))
+        {
+            egui::DragAndDrop::clear_payload(ui.ctx());
+            match contents_drop::plan(world, &ids, idx, ctrl, contents_drop::Target::Panel) {
+                Ok(drops) => tool.drop_inventory(world, idx, drops),
+                Err(reason) => tool.status = contents_drop::reason_text(reason).into(),
+            }
+        }
+    }
+}
+
+/// `PROTOTYPE_DEMO_CONTENTS_DROP=panelâ€¦` carries inventory onto the list.
+fn demo_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PROTOTYPE_DEMO").as_deref() == Ok("1") && std::env::var_os("PROTOTYPE_DEMO_CONTENTS_DROP").is_some())
+}
+
+fn demo_zone_id() -> egui::Id {
+    egui::Id::unique("contents_drop_demo_zone")
+}
+
+/// Where the Contents list was drawn, for the demo pointer.
+pub(crate) fn demo_zone(ctx: &egui::Context) -> Option<egui::Rect> {
+    ctx.data(|d| d.get_temp(demo_zone_id()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn item_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    tool: &mut BuildTool,
+    world: &mut World,
+    idx: usize,
+    object_id: uuid::Uuid,
+    item: &TaskItem,
+    editable: bool,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        widgets::inventory_spacing(ui);
+        if let Some(t) = crate::ui::icons::global(item_icon(item.asset_type as i32, item.inv_type as i32, item.flags)) {
+            let color = crate::ui::inventory::item_icon_color(item.asset_type as i32, item.inv_type as i32, p);
+            ui.add(egui::Image::new(&t).fit_to_exact_size(Vec2::splat(16.0)).tint(color));
+        } else {
+            ui.add_space(16.0);
+        }
+        // renaming in place
+        if contents_selection::rename_row(ui, tool, world, object_id, item.item_id) {
+            return;
+        }
+        let running = tool.contents.running.get(&(object_id, item.item_id)).copied();
+        let mut name = display_name(item);
+        if item.asset_type == AT_LSL_TEXT && running.is_some_and(|r| !r.0) {
+            name.push_str(prototype_i18n::tr!("build-ui-contents-stopped"));
+        }
+        let permissions = Permissions::new(item.owner_mask, item.next_owner_mask);
+        let selected = tool.ui.contents_selection.object == Some(object_id) && tool.ui.contents_selection.items.contains(&item.item_id);
+        let r = ui
+            .push_id(("task_item", object_id, item.item_id), |ui| {
+                permissions.row_with_rights(ui, p, &name, selected, tool.ui.contents_rights)
+            })
+            .inner
+            .on_hover_ui(|ui| {
+                ui.label(&name);
+                if !item.description.is_empty() {
+                    ui.label(&item.description);
+                }
+                widgets::divider(ui, p);
+                ui.label(permissions.tooltip());
+            });
+        if r.clicked() || r.secondary_clicked() {
+            tool.ui
+                .contents_selection
+                .select(ui, object_id, item.item_id, r.secondary_clicked());
+        }
+        widgets::reveal_search_selection(ui, &r, selected);
+        if r.drag_started() && !selected {
+            tool.ui.contents_selection.select(ui, object_id, item.item_id, false);
+        }
+        let item_modify = item.owner_mask & perm::MODIFY != 0;
+        // A selected row carries the whole selection (LLFolderView::startDrag).
+        let dragged = if r.hovered() || r.drag_started() || r.dragged() {
+            contents_selection::acted_on(tool, object_id, item)
+        } else {
+            vec![item.clone()]
+        };
+        crate::ui::inventory::task_drop::source(
+            ui,
+            &r,
+            world,
+            object_id,
+            &dragged,
+            crate::build::task_inventory::owned(world, object_id, tool.props.get(&object_id)),
+        );
+        let script = item.asset_type == AT_LSL_TEXT;
+        let preview =
+            matches!(item.asset_type, 0 | 1 | 20) && item.to_inv_item().is_some_and(|it| tool.task_preview_allowed(world, idx, &it));
+        menu::context_menu(&r, p, |ui| {
+            let taken = contents_selection::acted_on(tool, object_id, item);
+            let transfers: Result<Vec<_>, _> = taken.iter().map(|it| tool.task_transfer_kind(world, object_id, it)).collect();
+            let can_take = transfers.is_ok();
+            // LLTaskInvFVBridge::buildContextMenu: the scripts and notecards
+            // of an attachment that cannot be taken off stay closed.
+            let closed = (script || item.asset_type == 7) && world.rlva_locked_attachment(idx);
+            let can_open = (script || item.asset_type == 7 || preview) && !closed;
+            let no_open = if closed {
+                prototype_i18n::tr!("rlva-blocked")
+            } else if can_open {
+                ""
+            } else {
+                prototype_i18n::tr!("build-ui-contents-opening-items-inside-an-object-is-not-available-yet")
+            };
+            if menu::item_tip(ui, p, "folder-open-filled", prototype_i18n::tr!("common-open"), can_open, no_open) {
+                if script {
+                    tool.ui.requests.push(super::Request::Script {
+                        object: object_id,
+                        item: item.item_id,
+                    });
+                } else {
+                    tool.ui.open_notecard = Some((object_id, item.item_id));
+                }
+            }
+            if menu::item(ui, p, "info-circle-filled", prototype_i18n::tr!("common-properties")) {
+                tool.open_task_item_properties(object_id, item);
+            }
+            if menu::item_if(
+                ui,
+                p,
+                "pencil-filled",
+                prototype_i18n::tr!("common-rename"),
+                editable && item_modify && tool.ui.contents_selection.items.len() == 1,
+            ) {
+                contents_selection::begin_rename(tool, world, object_id, item.item_id);
+            }
+            if menu::item_if(ui, p, "trash-filled", prototype_i18n::tr!("common-delete"), editable) {
+                contents_selection::delete_selected(tool, world);
+            }
+            // a no-copy item leaves the object: the row says so
+            let moves = transfers.as_ref().is_ok_and(|kinds| {
+                kinds
+                    .iter()
+                    .any(|kind| matches!(kind, crate::build::task_inventory::TransferKind::Move { .. }))
+            });
+            let take = if moves {
+                prototype_i18n::tr!("task-transfer-move-menu")
+            } else {
+                prototype_i18n::tr!("build-ui-contents-copy-to-inventory")
+            };
+            let take_tip = prototype_i18n::tr!("contents-copy-selection-tip");
+            if menu::item_tip(ui, p, "briefcase-filled", take, can_take, take_tip) {
+                tool.copy_contents_to_inventory(world, idx, &taken);
+            }
+            if item.asset_type == AT_LSL_TEXT {
+                menu::separator(ui, p);
+                let on = running.map(|r| r.0).unwrap_or(true);
+                let (icon, label) = if on {
+                    ("player-stop-filled", prototype_i18n::tr!("common-stop"))
+                } else {
+                    ("player-play-filled", prototype_i18n::tr!("build-ui-contents-run"))
+                };
+                if menu::item_if(ui, p, icon, label, editable) {
+                    tool.set_script_running(world, idx, item.item_id, !on);
+                }
+            }
+        });
+        if r.double_clicked() {
+            if script {
+                tool.ui.requests.push(super::Request::Script {
+                    object: object_id,
+                    item: item.item_id,
+                });
+            } else if item.asset_type == 7 || preview {
+                tool.ui.open_notecard = Some((object_id, item.item_id));
+            } else if editable && item_modify {
+                contents_selection::begin_rename(tool, world, object_id, item.item_id);
+            }
+        }
+    });
+}
+
+/// The language of "New script" on a region with SLua (the `button new
+/// script` combo of panel_tools.xml: LSL or Lua).
+fn new_script_language(ui: &mut egui::Ui, tool: &mut BuildTool, lua: bool) {
+    let label = |lua: bool| {
+        if lua {
+            prototype_i18n::tr!("script-target-luau")
+        } else {
+            prototype_i18n::tr!("build-ui-contents-script-lsl")
+        }
+    };
+    let mut chosen = lua;
+    egui::ComboBox::from_id_salt("contents_new_script_language")
+        .selected_text(label(lua))
+        .width(56.0)
+        .show_ui(ui, |ui| {
+            for option in [false, true] {
+                ui.selectable_value(&mut chosen, option, label(option));
+            }
+        })
+        .response
+        .on_hover_text(prototype_i18n::tr!("build-ui-contents-script-language"));
+    if chosen != lua {
+        tool.ui.new_script_lua = Some(chosen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn double_click_opens_scripts_and_notecards_even_read_only_and_never_starts_renaming() {
+        for (asset_type, editable) in [(7, true), (7, false), (AT_LSL_TEXT, true), (AT_LSL_TEXT, false)] {
+            let ctx = egui::Context::default();
+            let p = crate::theme::Theme::default().palette();
+            let mut world = World::new(std::sync::Arc::new(crate::scene::avatar::AvatarLibrary::load()));
+            let mut tool = BuildTool::default();
+            let object = uuid::Uuid::from_u128(1);
+            let item = TaskItem {
+                item_id: uuid::Uuid::from_u128(2),
+                name: "Note".into(),
+                asset_type,
+                owner_mask: perm::COPY | perm::MODIFY | perm::TRANSFER,
+                ..Default::default()
+            };
+            let mut time = 0.0;
+            let mut frame = |events: Vec<egui::Event>, tool: &mut BuildTool| {
+                time += 0.04;
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                        time: Some(time),
+                        focused: true,
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| item_row(ui, &p, tool, &mut world, 0, object, &item, editable),
+                );
+                // This headless test inspects shapes without uploading textures.
+                output.textures_delta.clear();
+                output
+            };
+            let output = frame(Vec::new(), &mut tool);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text().starts_with("Note ") => Some(t.pos + t.galley.size() * 0.5),
+                    _ => None,
+                })
+                .expect("note row");
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    frame(
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        &mut tool,
+                    );
+                }
+            }
+            if asset_type == AT_LSL_TEXT {
+                assert!(tool.ui.open_notecard.is_none());
+                assert_eq!(tool.ui.requests.len(), 1);
+                assert!(matches!(
+                    tool.ui.requests.first(),
+                    Some(super::super::Request::Script { object: opened, item: opened_item })
+                    if *opened == object && *opened_item == item.item_id
+                ));
+            } else {
+                assert_eq!(tool.ui.open_notecard, Some((object, item.item_id)));
+                assert!(tool.ui.requests.is_empty());
+            }
+            assert!(tool.ui.rename.is_none());
+            assert_eq!(tool.ui.contents_selection.object, Some(object));
+            assert_eq!(tool.ui.contents_selection.items, std::collections::HashSet::from([item.item_id]));
+        }
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(root_label(0), prototype_i18n::tr!("contents-count", count = 0));
+        assert_eq!(root_label(3), prototype_i18n::tr!("contents-count", count = 3));
+        let i = TaskItem {
+            name: "New Script".into(),
+            asset_type: AT_LSL_TEXT,
+            owner_mask: perm::COPY | perm::MODIFY,
+            ..Default::default()
+        };
+        assert_eq!(display_name(&i), prototype_i18n::tr!("common-new-script"));
+        assert!(searchable_name(&i).contains(prototype_i18n::tr!("build-ui-contents-no-transfer")));
+    }
+}

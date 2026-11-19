@@ -1,0 +1,734 @@
+//! Open-conversation order, shared by the workspace and the older tab styles.
+//! Follows LLTabContainer's locked-tab rearrangement (lltabcontainer.cpp).
+//! Prototype additionally keeps each conversation in its original category
+//! (its kind, or the contact set shown apart that it belongs to, #1104).
+//!
+//! The entry dragged leaves its place and is carried under the pointer;
+//! the entries of its section slide out of its way to show where it would
+//! land (#910), and let go, it glides from where it was dropped into its
+//! place while the others glide on from where they were drawn, as the
+//! contact sets' list does (human request of 2026-11-15: the entry used to
+//! snap into place). An entry dropped outside the Conversations window pops
+//! its conversation out into a window of its own there, as a tab of the
+//! Legacy Viewer's IM container is torn off (`popout.rs`). The nearby
+//! chat's entry, pinned, does not move in the list but drags out the same
+//! way.
+
+use super::sidebar::{Section, section};
+use crate::{theme::Palette, world::World};
+use egui::{Pos2, Rect, Response, Vec2};
+use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
+
+struct Row {
+    id: Uuid,
+    section: Section,
+    /// Its place in the list: the drop is found on these, which the
+    /// slides never move.
+    rect: Rect,
+    /// Where it is drawn this frame: its place plus its slide.
+    drawn: Pos2,
+}
+
+/// The entry being dragged: its conversation (None: the nearby chat), where
+/// the pointer took it in the entry, and the entry's size.
+#[derive(Clone, Copy, Debug)]
+struct Grab {
+    conversation: Option<Uuid>,
+    offset: Vec2,
+    size: Vec2,
+}
+
+/// Where a conversation dropped in the list goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Landing {
+    /// Before the conversation, or after it (the last of its section).
+    Move(Uuid, bool),
+    /// Where it already is.
+    Stay,
+}
+
+/// A landing, and the places in its section the entry leaves (`from`)
+/// and takes (`to`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Spot {
+    landing: Landing,
+    from: usize,
+    to: usize,
+}
+
+/// What a drag let go of asks: the conversation (None: the nearby chat) in
+/// its own window, its top left corner at `pos`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PopOut {
+    pub conversation: Option<Uuid>,
+    pub pos: Pos2,
+}
+
+/// Where the dragged entry's ghost stands, and whether a drop there pops
+/// the conversation out (the pointer outside the window).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Ghost {
+    pub pos: Pos2,
+    pub size: Vec2,
+    pub out: bool,
+}
+
+/// `PROTOTYPE_DEMO_CONV_REORDER`: what the synthetic drag does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Demo {
+    /// `1`: the first conversation dropped after the next of its category.
+    Drop,
+    /// `hold`: the same drag, held over its landing place (the gap).
+    Hold,
+    /// `out`: the first conversation dropped at the left of the window.
+    Out,
+    /// `nearby`: the nearby chat dropped at the left of the window.
+    Nearby,
+}
+
+impl Demo {
+    pub fn parse(value: &str) -> Demo {
+        match value.trim() {
+            "hold" => Demo::Hold,
+            "out" => Demo::Out,
+            "nearby" => Demo::Nearby,
+            _ => Demo::Drop,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct State {
+    order: Vec<Uuid>,
+    grab: Option<Grab>,
+    rows: Vec<Row>,
+    /// The nearby chat's entry this frame.
+    local: Option<Rect>,
+    /// How far each entry is drawn from its place, easing toward its
+    /// target.
+    offsets: HashMap<Uuid, Vec2>,
+    /// Where the entries making way for the one dragged should stand,
+    /// below (+) or above (-) their place: found on the last frame's
+    /// pointer.
+    targets: HashMap<Uuid, f32>,
+    /// Let go on the last frame: where each entry was drawn, so that on
+    /// this one, laid out in the new order, it starts from there.
+    seed: HashMap<Uuid, Pos2>,
+    seeding: HashMap<Uuid, Pos2>,
+    /// The entry let go, gliding into its place over the others.
+    settling: Option<Uuid>,
+    /// The pass the list was last laid out on: a list not drawn since
+    /// (the window closed or minimised) drops its slides, and opens with
+    /// every entry in its place.
+    laid_out: Option<u64>,
+    /// The pointer's last position: it may leave the viewer's window before
+    /// the button is let go.
+    last_pointer: Option<Pos2>,
+}
+
+impl State {
+    pub fn begin(&mut self, ctx: &egui::Context, world: &World) {
+        let mut remaining: HashSet<_> = world.social.ims.iter().map(|s| s.other).collect();
+        self.order.retain(|id| remaining.remove(id));
+        let new = world.social.ims.iter().map(|s| s.other).filter(|id| remaining.remove(id));
+        // FSAutoOrderIMTabs: among the tabs of its kind
+        // (`conversation_options::insertion`), else after the others
+        let options = super::conversation_options::current();
+        if options.auto_order {
+            for id in new {
+                let kinds: Vec<_> = self.order.iter().map(|o| super::sidebar::kind(world, o)).collect();
+                let at = super::conversation_options::insertion(&kinds, super::sidebar::kind(world, &id), options.order, options.new_first);
+                self.order.insert(at, id);
+            }
+        } else {
+            self.order.extend(new);
+        }
+        let pass = ctx.cumulative_pass_nr();
+        if self.laid_out.is_none_or(|last| last + 1 < pass) {
+            self.offsets.clear();
+            self.targets.clear();
+            self.seed.clear();
+            self.settling = None;
+        }
+        self.offsets.retain(|id, _| self.order.contains(id));
+        if self.settling.is_some_and(|id| !self.order.contains(&id)) {
+            self.settling = None;
+        }
+        // Escape, the window left, or the button let go outside the
+        // viewer: the carried entry glides home from its card, as a drop
+        // does (the rows are still the last pass's)
+        if let Some(grab) = self.grab
+            && (ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+                || ctx.input(|i| !i.focused || (!i.pointer.primary_down() && !i.pointer.primary_released())))
+        {
+            self.release(grab.conversation.zip(self.last_pointer.map(|at| at - grab.offset)));
+            self.cancel();
+        }
+        self.rows.clear();
+        self.local = None;
+        self.seeding = std::mem::take(&mut self.seed);
+    }
+
+    fn cancel(&mut self) {
+        self.grab = None;
+        self.targets.clear();
+        self.last_pointer = None;
+    }
+
+    pub fn sessions(&self, world: &World) -> Vec<(Uuid, usize)> {
+        let unread: HashMap<_, _> = world.social.ims.iter().map(|s| (s.other, s.unread)).collect();
+        self.order.iter().filter_map(|id| unread.get(id).map(|n| (*id, *n))).collect()
+    }
+
+    /// The drag of an entry starts: where the pointer took it.
+    fn take(&mut self, conversation: Option<Uuid>, response: &Response) {
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            // where the button went down: the drag starts a few points further
+            let at = response
+                .ctx
+                .input(|i| i.pointer.press_origin())
+                .or(response.interact_pointer_pos())
+                .unwrap_or(response.rect.center());
+            self.grab = Some(Grab {
+                conversation,
+                offset: at - response.rect.min,
+                size: response.rect.size(),
+            });
+        }
+    }
+
+    pub fn row(&mut self, world: &World, id: Uuid, response: &Response) {
+        self.take(Some(id), response);
+        let offset = self.offsets.get(&id).copied().unwrap_or(Vec2::ZERO);
+        self.rows.push(Row {
+            id,
+            section: section(world, &id),
+            rect: response.rect,
+            drawn: response.rect.min + offset,
+        });
+    }
+
+    /// How far from its place `id`'s entry is drawn this frame: called
+    /// just before it is laid out, at `ui`'s cursor. The first frame after
+    /// a drop it stands where it was drawn (the one dropped: where its
+    /// card was let go), then it eases to its target, as the contact sets'
+    /// rows do (`people/sets/sidebar.rs`).
+    pub fn slide(&mut self, ui: &egui::Ui, id: Uuid) -> Vec2 {
+        let place = ui.cursor().min;
+        if let Some(from) = self.seeding.get(&id) {
+            let offset = *from - place;
+            self.offsets.insert(id, offset);
+            ui.ctx().request_repaint();
+            return offset;
+        }
+        let target = Vec2::new(0.0, self.targets.get(&id).copied().unwrap_or(0.0));
+        let Some(offset) = self.offsets.get_mut(&id) else {
+            if target == Vec2::ZERO {
+                return Vec2::ZERO;
+            }
+            self.offsets.insert(id, Vec2::ZERO);
+            return self.slide(ui, id);
+        };
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        *offset += (target - *offset) * (1.0 - (-dt * SLIDE_RATE).exp());
+        if (target - *offset).length() <= 0.5 {
+            *offset = target;
+        } else {
+            ui.ctx().request_repaint();
+        }
+        let offset = *offset;
+        if offset == Vec2::ZERO {
+            self.offsets.remove(&id);
+            if self.settling == Some(id) {
+                self.settling = None;
+            }
+        }
+        offset
+    }
+
+    /// Lay out `id`'s entry (`add`, drawn `offset` from its place, which it
+    /// returns) as the drag wants it: hidden while carried (its card is
+    /// under the pointer; it keeps the drag's response), over the others
+    /// on `face` while it lands, its card's shadow fading as it does.
+    pub fn draw<R>(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Palette,
+        id: Uuid,
+        offset: Vec2,
+        face: Option<egui::Color32>,
+        add: impl FnOnce(&mut egui::Ui) -> (R, Rect),
+    ) -> R {
+        if self.dragging(Some(id)) {
+            return ui
+                .scope(|ui| {
+                    ui.multiply_opacity(0.0);
+                    add(ui).0
+                })
+                .inner;
+        }
+        if self.settling != Some(id) {
+            return add(ui).0;
+        }
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(("conversation_landing", id)));
+        ui.scope_builder(egui::UiBuilder::new().layer_id(layer), |ui| {
+            let shadow = ui.painter().add(egui::Shape::Noop);
+            let under = ui.painter().add(egui::Shape::Noop);
+            let (out, place) = add(ui);
+            let drawn = place.translate(offset);
+            let radius = ui.visuals().window_corner_radius;
+            let card = egui::epaint::Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: p.navy.gamma_multiply(0.5 * (offset.length() / 40.0).min(1.0)),
+            };
+            ui.painter().set(shadow, card.as_shape(drawn, radius));
+            if let Some(face) = face {
+                ui.painter().set(under, egui::epaint::RectShape::filled(drawn, radius, face));
+            }
+            out
+        })
+        .inner
+    }
+
+    /// How far from its place `id`'s entry is drawn.
+    #[cfg(test)]
+    pub fn offset_of(&self, id: Uuid) -> Vec2 {
+        self.offsets.get(&id).copied().unwrap_or(Vec2::ZERO)
+    }
+
+    /// The entry let go is still gliding to its place: drawn over the
+    /// others.
+    #[cfg(test)]
+    fn lifted(&self, id: Uuid) -> bool {
+        self.settling == Some(id)
+    }
+
+    /// The nearby chat's entry: it drags out of the window, never within
+    /// the list.
+    pub fn local_row(&mut self, response: &Response) {
+        self.take(None, response);
+        self.local = Some(response.rect);
+    }
+
+    /// The conversation's entry is the one dragged (None: the nearby chat).
+    pub fn dragging(&self, conversation: Option<Uuid>) -> bool {
+        self.grab.is_some_and(|g| g.conversation == conversation)
+    }
+
+    /// The ghost of the entry dragged, under the pointer where it took it.
+    pub fn ghost(&self, ctx: &egui::Context) -> Option<Ghost> {
+        let grab = self.grab?;
+        let at = ctx.pointer_interact_pos().or(self.last_pointer)?;
+        let out = ctx.data(|d| d.get_temp::<bool>(out_id())).unwrap_or(false);
+        Some(Ghost {
+            pos: at - grab.offset,
+            size: grab.size,
+            out,
+        })
+    }
+
+    #[cfg(test)]
+    fn landing(&self, grab: Grab, at: Pos2, clip: Rect) -> Option<Landing> {
+        self.spot(grab, at, clip).map(|spot| spot.landing)
+    }
+
+    fn spot(&self, grab: Grab, at: Pos2, clip: Rect) -> Option<Spot> {
+        let id = grab.conversation?;
+        let source = self.rows.iter().find(|row| row.id == id)?;
+        if !clip.contains(at) {
+            return None;
+        }
+        // the section of the entry, at the entries' places: a drop on a
+        // pinned entry, a section head or another section is none
+        let same: Vec<&Row> = self.rows.iter().filter(|row| row.section == source.section).collect();
+        let (first, last) = (same.first()?, same.last()?);
+        let half = source.rect.height() * 0.5;
+        if at.y < first.rect.top() - half || at.y > last.rect.bottom() + half {
+            return None;
+        }
+        let others: Vec<&Row> = same.iter().copied().filter(|row| row.id != id).collect();
+        let to = others.iter().filter(|row| row.rect.center().y < at.y).count();
+        let from = same.iter().position(|row| row.id == id)?;
+        let landing = if to == from {
+            Landing::Stay
+        } else if let Some(row) = others.get(to) {
+            Landing::Move(row.id, false)
+        } else {
+            Landing::Move(others.last()?.id, true)
+        };
+        Some(Spot { landing, from, to })
+    }
+
+    /// Where the entries of the dragged one's section stand while it would
+    /// land at `spot`: those between make way, one place toward the one it
+    /// left.
+    fn make_way(&mut self, id: Uuid, spot: Option<Spot>) {
+        self.targets.clear();
+        let Some(spot) = spot else { return };
+        let Some(section) = self.rows.iter().find(|row| row.id == id).map(|row| row.section) else {
+            return;
+        };
+        let same: Vec<(Uuid, f32)> = self
+            .rows
+            .iter()
+            .filter(|row| row.section == section)
+            .map(|row| (row.id, row.rect.top()))
+            .collect();
+        for (i, (other, top)) in same.iter().enumerate() {
+            let j = shifted_slot(i, spot.from, spot.to);
+            if *other != id && j != i {
+                self.targets.insert(*other, same[j].1 - top);
+            }
+        }
+    }
+
+    /// Let go: every entry starts the next frame where it is drawn now, the
+    /// one dropped where its card is (`at`), and glides from there.
+    fn release(&mut self, dropped: Option<(Uuid, Pos2)>) {
+        self.seed = self.rows.iter().map(|row| (row.id, row.drawn)).collect();
+        self.settling = None;
+        if let Some((id, at)) = dropped {
+            self.seed.insert(id, at);
+            self.settling = Some(id);
+        }
+    }
+
+    /// After the list's entries: the drag's gap, cursor and scrolling, and
+    /// its drop. A drop outside the window asks for the conversation's own
+    /// window there.
+    pub fn finish(&mut self, ui: &mut egui::Ui, p: &Palette, demo: Option<Demo>) -> Option<PopOut> {
+        // the window holding the list (the Conversations window)
+        let window = ui.ctx().memory(|m| m.area_rect(ui.layer_id().id)).unwrap_or(ui.clip_rect());
+        if demo.is_some() && self.grab.is_none() {
+            let first = self.rows.first().map(|first| first.rect);
+            let second = self
+                .rows
+                .first()
+                .and_then(|first| self.rows.iter().skip(1).find(|row| row.section == first.section))
+                .map(|row| row.rect);
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    demo_id(),
+                    DemoRects {
+                        demo: demo.unwrap_or(Demo::Drop),
+                        first,
+                        second,
+                        local: self.local,
+                        window,
+                    },
+                )
+            });
+        }
+        // the frame after a drop has started every slide
+        self.seeding.clear();
+        self.laid_out = Some(ui.ctx().cumulative_pass_nr());
+        let grab = self.grab?;
+        let source = match grab.conversation {
+            Some(id) => self.rows.iter().find(|row| row.id == id).map(|row| row.rect),
+            None => self.local,
+        };
+        let Some(source) = source else {
+            self.cancel();
+            return None;
+        };
+        let clip = ui.clip_rect();
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        if pointer.is_some() {
+            self.last_pointer = pointer;
+        }
+        let at = pointer.or(self.last_pointer);
+        let out = at.is_some_and(|at| !window.contains(at));
+        ui.ctx().data_mut(|d| d.insert_temp(out_id(), out));
+        let spot = if out { None } else { at.and_then(|at| self.spot(grab, at, clip)) };
+        let landing = spot.map(|spot| spot.landing);
+        if let Some(id) = grab.conversation {
+            self.make_way(id, spot);
+        }
+        // where it was taken from, while nothing slides into its place
+        if !matches!(landing, Some(Landing::Move(..))) {
+            ui.painter()
+                .rect_filled(source, ui.visuals().window_corner_radius, p.violet.gamma_multiply(0.12));
+        }
+        if ui.input(|i| i.pointer.primary_released()) {
+            let drop = if out {
+                // the others close the gap it leaves smoothly
+                self.release(None);
+                at.map(|at| PopOut {
+                    conversation: grab.conversation,
+                    pos: at - grab.offset,
+                })
+            } else {
+                self.release(grab.conversation.zip(at.map(|at| at - grab.offset)));
+                if let (Some(Landing::Move(target, after)), Some(id)) = (landing, grab.conversation) {
+                    self.move_to(id, target, after);
+                }
+                None
+            };
+            self.cancel();
+            return drop;
+        }
+        let valid = landing.is_some() || out || at.is_some_and(|at| source.contains(at));
+        ui.ctx().set_cursor_icon(if valid {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::NotAllowed
+        });
+        if let Some(at) = pointer.filter(|at| clip.contains(*at)) {
+            let edge = 24.0;
+            let speed = if at.y < clip.top() + edge {
+                (clip.top() + edge - at.y) / edge
+            } else if at.y > clip.bottom() - edge {
+                -(at.y - clip.bottom() + edge) / edge
+            } else {
+                0.0
+            };
+            let dt = ui.input(|i| i.stable_dt.min(0.1));
+            ui.scroll_with_delta(egui::vec2(0.0, speed * 420.0 * dt));
+        }
+        ui.ctx().request_repaint();
+        None
+    }
+
+    fn move_to(&mut self, source: Uuid, target: Uuid, after: bool) {
+        let Some(from) = self.order.iter().position(|id| *id == source) else {
+            return;
+        };
+        self.order.remove(from);
+        if let Some(to) = self.order.iter().position(|id| *id == target) {
+            self.order.insert(to + usize::from(after), source);
+        } else {
+            self.order.insert(from, source);
+        }
+    }
+}
+
+/// How quickly an entry eases to its target (per second, exponential):
+/// the contact sets' list's.
+const SLIDE_RATE: f32 = 22.0;
+
+/// Where the entry at `i` stands while the one at `from` is carried to
+/// `to`: those between make way, one place toward the one it left.
+fn shifted_slot(i: usize, from: usize, to: usize) -> usize {
+    if from < to && i > from && i <= to {
+        i - 1
+    } else if to < from && i >= to && i < from {
+        i + 1
+    } else {
+        i
+    }
+}
+
+/// Whether the ghost stands outside the window this frame (`finish`).
+fn out_id() -> egui::Id {
+    egui::Id::unique("conversation_drag_out")
+}
+
+fn demo_id() -> egui::Id {
+    egui::Id::unique("conversation_reorder_demo")
+}
+
+/// What the synthetic drag aims at, kept by `finish`.
+#[derive(Clone, Copy)]
+struct DemoRects {
+    demo: Demo,
+    first: Option<Rect>,
+    second: Option<Rect>,
+    local: Option<Rect>,
+    window: Rect,
+}
+
+/// Synthetic pointer events, enabled only by the explicit offline fixture:
+/// pressed at frame 701, moved for 19 frames, let go at frame 760 (held on
+/// with `hold`).
+pub(super) fn demo_events(ctx: &egui::Context, frame: u64) -> Vec<egui::Event> {
+    if !(700..=760).contains(&frame) {
+        return Vec::new();
+    }
+    let Some(rects) = ctx.data(|d| d.get_temp::<DemoRects>(demo_id())) else {
+        return Vec::new();
+    };
+    let demo = rects.demo;
+    let source = match demo {
+        Demo::Nearby => rects.local,
+        _ => rects.first,
+    };
+    let Some(source) = source else {
+        return Vec::new();
+    };
+    let start = egui::pos2(source.left() + source.width() * 0.4, source.center().y);
+    let end = match demo {
+        Demo::Drop | Demo::Hold => {
+            let Some(second) = rects.second else {
+                return Vec::new();
+            };
+            // held, the card stands over the room the second leaves it
+            let y = if demo == Demo::Hold {
+                second.center().y + 8.0
+            } else {
+                second.bottom() - 6.0
+            };
+            egui::pos2(second.left() + second.width() * 0.4, y)
+        }
+        // at the left of the window, where there is room
+        Demo::Out | Demo::Nearby => egui::pos2((rects.window.left() - 220.0).max(60.0), rects.window.top() + 60.0),
+    };
+    let pos = start.lerp(end, (frame.saturating_sub(701) as f32 / 19.0).min(1.0));
+    let mut events = vec![egui::Event::PointerMoved(pos)];
+    if frame == 701 || (frame == 760 && demo != Demo::Hold) {
+        events.push(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: frame == 701,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: Uuid = Uuid::from_u128(1);
+    const B: Uuid = Uuid::from_u128(2);
+    const C: Uuid = Uuid::from_u128(3);
+
+    /// Three private conversations at rest, 44 high, 2 apart, from y 100.
+    fn state(grabbed: Uuid) -> (State, Grab) {
+        let mut st = State {
+            order: vec![A, B, C],
+            ..State::default()
+        };
+        for (n, id) in [A, B, C].into_iter().enumerate() {
+            let rect = Rect::from_min_size(egui::pos2(10.0, 100.0 + 46.0 * n as f32), egui::vec2(200.0, 44.0));
+            st.rows.push(Row {
+                id,
+                section: Section::Kind(super::super::sidebar::Kind::Private),
+                rect,
+                drawn: rect.min,
+            });
+        }
+        let grab = Grab {
+            conversation: Some(grabbed),
+            offset: egui::vec2(20.0, 22.0),
+            size: egui::vec2(200.0, 44.0),
+        };
+        st.grab = Some(grab);
+        (st, grab)
+    }
+
+    const CLIP: Rect = Rect {
+        min: egui::pos2(0.0, 0.0),
+        max: egui::pos2(400.0, 600.0),
+    };
+
+    #[test]
+    fn the_landing_is_found_on_the_entries_at_rest() {
+        let (st, grab) = state(A);
+        // over its own place, then between B and C, then below C
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 120.0), CLIP), Some(Landing::Stay));
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 150.0), CLIP), Some(Landing::Stay));
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 170.0), CLIP), Some(Landing::Move(C, false)));
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 230.0), CLIP), Some(Landing::Move(C, true)));
+        // half an entry past the section still lands at its end, further is none
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 250.0), CLIP), Some(Landing::Move(C, true)));
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 280.0), CLIP), None);
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 60.0), CLIP), None);
+        // C taken up above A
+        let (st, grab) = state(C);
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 105.0), CLIP), Some(Landing::Move(A, false)));
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 200.0), CLIP), Some(Landing::Stay));
+        // outside the list's clip
+        assert_eq!(st.landing(grab, egui::pos2(500.0, 105.0), CLIP), None);
+    }
+
+    #[test]
+    fn the_entries_between_make_way_for_the_one_carried() {
+        // A carried below C: B and C move up one place, nothing else moves
+        let (mut st, grab) = state(A);
+        let spot = st.spot(grab, egui::pos2(50.0, 230.0), CLIP);
+        assert_eq!(
+            spot,
+            Some(Spot {
+                landing: Landing::Move(C, true),
+                from: 0,
+                to: 2
+            })
+        );
+        st.make_way(A, spot);
+        assert_eq!(st.targets.get(&B), Some(&-46.0));
+        assert_eq!(st.targets.get(&C), Some(&-46.0));
+        assert_eq!(st.targets.get(&A), None, "the card follows the pointer");
+        // C carried above B: B moves down one place, A stays
+        let (mut st, grab) = state(C);
+        st.make_way(C, st.spot(grab, egui::pos2(50.0, 150.0), CLIP));
+        assert_eq!(st.targets.get(&B), Some(&46.0));
+        assert_eq!(st.targets.get(&A), None);
+        // back over its own place, or out of the list: nothing moves
+        let (mut st, grab) = state(A);
+        st.make_way(A, st.spot(grab, egui::pos2(50.0, 120.0), CLIP));
+        assert!(st.targets.is_empty());
+        st.make_way(A, None);
+        assert!(st.targets.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_entry_glides_from_where_it_was_let_go_into_its_place() {
+        let (mut st, _) = state(A);
+        // B drawn a place up (making way), A's card let go at (30, 190)
+        st.rows[1].drawn = egui::pos2(10.0, 100.0);
+        st.release(Some((A, egui::pos2(30.0, 190.0))));
+        st.move_to(A, C, true);
+        assert_eq!(st.order, vec![B, C, A]);
+        st.grab = None;
+        let mut frames = crate::ui::widgets::elide_tests::Frames::new();
+        let mut first = Vec::new();
+        frames.run(Vec::new(), |ui| {
+            st.seeding = std::mem::take(&mut st.seed);
+            // laid out in the new order: B at 100, C at 146, A at 192
+            for (id, top) in [(B, 100.0), (C, 146.0), (A, 192.0)] {
+                let child =
+                    ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(egui::pos2(10.0, top), egui::vec2(200.0, 44.0))));
+                first.push((id, st.slide(&child, id)));
+            }
+            st.seeding.clear();
+        });
+        // B was drawn at its new place: it does not move; A starts at its card
+        assert_eq!(first[0], (B, Vec2::ZERO));
+        assert_eq!(first[2], (A, egui::vec2(20.0, -2.0)));
+        assert!(st.lifted(A), "the card glides over the others");
+        // then it eases in and lands
+        let mut last = Vec2::splat(f32::MAX);
+        for _ in 0..120 {
+            frames.run(Vec::new(), |ui| {
+                let child =
+                    ui.new_child(egui::UiBuilder::new().max_rect(Rect::from_min_size(egui::pos2(10.0, 192.0), egui::vec2(200.0, 44.0))));
+                let now = st.slide(&child, A);
+                assert!(now.length() <= last.length(), "it never moves away from its place");
+                last = now;
+            });
+        }
+        assert_eq!(last, Vec2::ZERO);
+        assert!(!st.lifted(A), "landed, it is drawn with the others again");
+    }
+
+    #[test]
+    fn the_nearby_chat_never_lands_in_the_list() {
+        let (mut st, mut grab) = state(A);
+        grab.conversation = None;
+        st.grab = Some(grab);
+        assert_eq!(st.landing(grab, egui::pos2(50.0, 170.0), CLIP), None);
+        assert!(st.dragging(None) && !st.dragging(Some(A)));
+    }
+
+    #[test]
+    fn the_demo_modes_parse() {
+        assert_eq!(Demo::parse("1"), Demo::Drop);
+        assert_eq!(Demo::parse("hold"), Demo::Hold);
+        assert_eq!(Demo::parse(" out "), Demo::Out);
+        assert_eq!(Demo::parse("nearby"), Demo::Nearby);
+    }
+}

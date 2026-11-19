@@ -1,0 +1,11 @@
+# Windows batch files always get CRLF line endings: cmd.exe misreads labels
+# and goto in a batch file with Unix line endings.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Raw grayscale terrain texels must keep their exact bytes.
+*.r8 binary
+
+# Shell scripts always get Unix line endings: bash stops on a carriage return
+# (the agents' hook of .claude/hooks runs in Git Bash on Windows).
+*.sh text eol=lf

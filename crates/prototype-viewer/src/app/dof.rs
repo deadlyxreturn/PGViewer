@@ -1,0 +1,187 @@
+//! The depth of field of a frame (LLPipeline::renderDoF's focus point:
+//! the camera's focus, the point under the pointer or the crosshair, a
+//! clicked or locked point), and its demo (`PROTOTYPE_DEMO_DOF`).
+
+use super::App;
+use crate::dof::{self, FocusMode};
+use prototype_render::{DepthOfField, Renderer};
+
+/// PROTOTYPE_DEMO_DOF=<f-number>:<focus distance m>[:debug]: the effect on,
+/// at that aperture, focused at that distance (no transition).
+fn demo_lens() -> Option<(f32, f32, bool)> {
+    static DEMO: std::sync::OnceLock<Option<(f32, f32, bool)>> = std::sync::OnceLock::new();
+    *DEMO.get_or_init(|| {
+        let v = std::env::var("PROTOTYPE_DEMO_DOF").ok()?;
+        let mut parts = v.split(':');
+        let n = parts.next()?.parse().ok()?;
+        let d = parts.next()?.parse().ok()?;
+        Some((n, d, parts.next() == Some("debug")))
+    })
+}
+
+impl App {
+    /// The largest blur, in pixels, of a photo of `size` taken now from a
+    /// `window` (pixels): None when no depth of field may be drawn (the lens
+    /// `dof_frame` gives, without its conditions of the moment).
+    pub(super) fn photo_dof_max_coc(&self, size: (u32, u32), window: (u32, u32)) -> Option<f32> {
+        let s = if self.demo && demo_lens().is_some() {
+            dof::Settings {
+                enabled: true,
+                ..self.settings.dof.clone()
+            }
+        } else if self.panels.snapshot {
+            self.settings.snapshot.dof.applied(&self.settings.dof).0
+        } else {
+            self.settings.dof.clone()
+        };
+        let aspect = size.0 as f32 / size.1.max(1) as f32;
+        let view = dof::View::photo(self.camera.fov_y, window, aspect, size.1);
+        s.enabled.then(|| dof::lens(&s, 1.0, view, false).max_coc)
+    }
+
+    /// The lens of this frame, None when the effect is off (or in edit mode
+    /// without RenderDepthOfFieldInEditMode), for the image `view` (the
+    /// window's, or a photo's).
+    pub(super) fn dof_frame(&mut self, renderer: &mut Renderer, dt: f32, view: dof::View) -> Option<DepthOfField> {
+        let demo = self.demo.then(demo_lens).flatten();
+        if let Some((n, d, debug)) = demo {
+            let s = dof::Settings {
+                enabled: true,
+                f_number: n,
+                ..self.settings.dof.clone()
+            };
+            self.dof_focus.set(d);
+            if self.frame_count == 600 {
+                // the scene's distances along the view axis, to read the captures
+                let (eye, at) = (self.camera.position, self.camera.target - self.camera.position);
+                let avatar = dof::distance_along(eye, at, self.world.agent.position);
+                let others: Vec<String> = self
+                    .world
+                    .objects
+                    .avatars()
+                    .filter(|(_, a)| a.full_id != self.world.agent_id)
+                    .map(|(_, a)| format!("{:.1}", dof::distance_along(eye, at, a.position)))
+                    .collect();
+                log::info!(
+                    "dof demo: f/{n}, focus {d} m; own avatar at {avatar:.1} m, other avatars at {} m",
+                    others.join(", ")
+                );
+            }
+            return Some(dof::lens(&s, d, view, debug));
+        }
+        // the Director's lens while its window is open with its depth of
+        // field on: at its own aperture, focused on the lock's target or at
+        // the distance set there
+        if let Some((f_number, distance)) = self.director_dof() {
+            let s = dof::Settings {
+                enabled: true,
+                f_number,
+                ..self.settings.dof.clone()
+            };
+            let focus = self.dof_focus.update(distance, dt, s.transition);
+            return Some(dof::lens(&s, focus, view, false));
+        }
+        // the photo window's lens while it is open, off included (its All
+        // sharp is sharp, not the Preferences' blur), else the Preferences'
+        // (never changed by the window)
+        // a 360° picture has no depth of field (the blur would differ from
+        // face to face and show at their edges): the live view shows what
+        // the picture will, with none
+        if self.pano_open() || self.capture_360.drawing_face() {
+            return None;
+        }
+        let photo = &self.settings.snapshot.dof;
+        let (s, manual) = if self.panels.snapshot {
+            photo.applied(&self.settings.dof)
+        } else {
+            (self.settings.dof.clone(), None)
+        };
+        if !s.enabled
+            || (self.build.open && !s.in_edit)
+            || posing_turns_dof_off(self.ik_editor.posing(), self.ik_editor.poser_dof(), self.panels.snapshot)
+            || !self.in_world()
+        {
+            return None;
+        }
+        // the viewfinder's AF-S: the lens where its hunt has it (the image
+        // pumps through the focus like a camera's), no transition of its own;
+        // a group focus keeps its zone sharp, from its nearest face to its
+        // farthest (`snapshot::viewfinder::Zone`)
+        let viewfinder = self.viewfinder_on() && photo.enabled;
+        if viewfinder && photo.focus == crate::dof::PhotoFocus::Click {
+            let d = self.snapshots.vf.af.distance();
+            self.dof_focus.set(d);
+            let (near, far) = self.snapshots.vf.zone.map_or((d, d), |z| z.at(d));
+            let mut lens = dof::lens(&s, near, view, false);
+            lens.focus_far = far;
+            return Some(lens);
+        }
+        let eye = self.camera.position;
+        let at = self.camera.target - self.camera.position;
+        let (w, h) = renderer.size();
+        let pointer = if self.camera.mouselook() {
+            // the crosshair
+            renderer.hover_pick(w as f32 * 0.5, h as f32 * 0.5)
+        } else if self.egui_ctx.is_pointer_over_egui() {
+            None
+        } else {
+            renderer.hover_pick(self.cursor_pos.0, self.cursor_pos.1)
+        };
+        let point = match s.focus {
+            FocusMode::Camera if !self.camera.mouselook() => Some(self.camera.target),
+            FocusMode::Camera | FocusMode::Pointer => pointer.or(self.dof_focus.point),
+            FocusMode::Click => {
+                let clicked = self.egui_ctx.input(|i| i.pointer.primary_pressed()) && !self.egui_ctx.is_pointer_over_egui();
+                if clicked && pointer.is_some() {
+                    self.dof_focus.point = pointer;
+                }
+                self.dof_focus.point.or(Some(self.camera.target))
+            }
+            // the point focused when it was locked
+            FocusMode::Locked => self.dof_focus.point.or(pointer).or(Some(self.camera.target)),
+        };
+        if s.focus != FocusMode::Click && s.focus != FocusMode::Locked {
+            // what a lock keeps
+            self.dof_focus.point = point;
+        }
+        let target = manual.unwrap_or_else(|| point.map_or(f32::NAN, |p| dof::distance_along(eye, at, p)));
+        let transition = s.transition;
+        let focus = self.dof_focus.update(target, dt, transition);
+        let mut lens = dof::lens(&s, focus, view, false);
+        // focus peaking in manual focus, on the view only (never a photo)
+        if viewfinder && photo.focus == crate::dof::PhotoFocus::Manual && self.snapshots.capturing.is_none() {
+            lens.peaking = crate::ui::viewfinder::peaking_color(&self.palette, self.settings.snapshot.viewfinder.peaking).map(|c| {
+                let l = egui::Rgba::from(c);
+                [l.r(), l.g(), l.b()]
+            });
+        }
+        Some(lens)
+    }
+}
+
+/// Whether the poser turns the depth of field off: only outside the photo
+/// window, while its "Depth of field while posing" is off. The photo
+/// window's lens is the user's choice for the shot (off included, its All
+/// sharp), so posing in it keeps that lens. An Prototype rule: the Legacy
+/// Viewer's poser leaves the depth of field alone.
+fn posing_turns_dof_off(posing: bool, poser_dof: bool, photo_open: bool) -> bool {
+    posing && !poser_dof && !photo_open
+}
+
+#[cfg(test)]
+mod tests {
+    use super::posing_turns_dof_off;
+
+    #[test]
+    fn the_photo_window_keeps_its_depth_of_field_while_posing() {
+        // posing outside the photo window: the poser's setting decides
+        assert!(posing_turns_dof_off(true, false, false));
+        assert!(!posing_turns_dof_off(true, true, false));
+        // in the photo window: its lens stays, whatever the poser's setting
+        assert!(!posing_turns_dof_off(true, false, true));
+        assert!(!posing_turns_dof_off(true, true, true));
+        // not posing: nothing changes
+        assert!(!posing_turns_dof_off(false, false, false));
+        assert!(!posing_turns_dof_off(false, false, true));
+    }
+}

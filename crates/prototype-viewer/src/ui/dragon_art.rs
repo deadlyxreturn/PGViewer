@@ -1,0 +1,714 @@
+//! PG Viewer's skin pictures: the login background, the orbs, the
+//! button faces and the ornaments of the login card and Preferences.
+//!
+//! A picture is looked up by its name (`background`, `balls/ball-4`,
+//! `login-crest`, ...) in, first come first served:
+//! - the `skin` folder of the config folder (the user's own),
+//! - the `skin` folder next to the exe,
+//! - the repository's `skin/` folder, embedded in the exe at build time.
+//!
+//! SVG, PNG, JPEG and WebP are read, in that order of preference. Pictures
+//! decode on a background thread; until one is ready (or when there is none)
+//! the painters fall back to drawn shapes.
+
+use egui::{Color32, Context, Painter, Pos2, Rect, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2, pos2, vec2};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/skin_files.rs"));
+}
+
+const EXTENSIONS: [&str; 5] = ["svg", "png", "jpg", "jpeg", "webp"];
+
+/// Largest side a vector picture is drawn at (its texture).
+const SVG_PX: u32 = 1024;
+
+fn runtime_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![crate::settings::config_dir().join("skin")];
+    if let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        dirs.push(exe.join("skin"));
+    }
+    dirs
+}
+
+/// The bytes of the picture `name` and whether it is an SVG.
+fn find(name: &str) -> Option<(Vec<u8>, bool)> {
+    for dir in runtime_dirs() {
+        for ext in EXTENSIONS {
+            let path = dir.join(format!("{name}.{ext}"));
+            if let Ok(bytes) = std::fs::read(&path) {
+                return Some((bytes, ext == "svg"));
+            }
+        }
+    }
+    for ext in EXTENSIONS {
+        let file = format!("{name}.{ext}");
+        if let Some((_, bytes)) = embedded::SKIN_FILES.iter().find(|(n, _)| *n == file) {
+            return Some((bytes.to_vec(), ext == "svg"));
+        }
+    }
+    None
+}
+
+/// Whether the skin has a picture called `name`.
+pub fn has(name: &str) -> bool {
+    static KNOWN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(v) = known.lock().ok().and_then(|k| k.get(name).copied()) {
+        return v;
+    }
+    let v = find(name).is_some();
+    if let Ok(mut k) = known.lock() {
+        k.insert(name.to_owned(), v);
+    }
+    v
+}
+
+/// The files of the skin's `icons/` folder, embedded or beside the exe:
+/// (icon name without extension, bytes, is SVG).
+pub fn icon_files() -> Vec<(String, Vec<u8>, bool)> {
+    let mut out: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    let mut push = |file: &str, bytes: Vec<u8>| {
+        let Some((stem, ext)) = file.rsplit_once('.') else { return };
+        let ext = ext.to_ascii_lowercase();
+        if !EXTENSIONS.contains(&ext.as_str()) || out.iter().any(|(n, _, _)| n == stem) {
+            return;
+        }
+        out.push((stem.to_owned(), bytes, ext == "svg"));
+    };
+    for dir in runtime_dirs() {
+        if let Ok(rd) = std::fs::read_dir(dir.join("icons")) {
+            for e in rd.flatten() {
+                if let (Some(name), Ok(bytes)) = (e.file_name().to_str().map(str::to_owned), std::fs::read(e.path())) {
+                    push(&name, bytes);
+                }
+            }
+        }
+    }
+    for (file, bytes) in embedded::SKIN_FILES {
+        if let Some(name) = file.strip_prefix("icons/") {
+            push(name, bytes.to_vec());
+        }
+    }
+    out
+}
+
+/// Decodes a picture to an image, an SVG drawn `max_px` on its longer side.
+pub fn decode(bytes: &[u8], svg: bool, max_px: u32) -> Option<egui::ColorImage> {
+    if svg {
+        let opt = resvg::usvg::Options::default();
+        let tree = resvg::usvg::Tree::from_data(bytes, &opt).ok()?;
+        let size = tree.size();
+        let scale = max_px as f32 / size.width().max(size.height()).max(1.0);
+        let (w, h) = (
+            (size.width() * scale).round().max(1.0) as u32,
+            (size.height() * scale).round().max(1.0) as u32,
+        );
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(w, h)?;
+        resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+        Some(egui::ColorImage::from_rgba_premultiplied([w as usize, h as usize], pixmap.data()))
+    } else {
+        let img = image::load_from_memory(bytes).ok()?;
+        let img = if img.width().max(img.height()) > 4096 {
+            img.resize(4096, 4096, image::imageops::FilterType::Triangle)
+        } else {
+            img
+        };
+        let rgba = img.to_rgba8();
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [rgba.width() as usize, rgba.height() as usize],
+            rgba.as_raw(),
+        ))
+    }
+}
+
+enum Slot {
+    Loading,
+    Ready(Option<Arc<egui::ColorImage>>),
+}
+
+fn slots() -> &'static Mutex<HashMap<String, Slot>> {
+    static SLOTS: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// The texture of the picture `name`, once decoded; None while it decodes
+/// or when the skin has none.
+pub fn texture(ctx: &Context, name: &str) -> Option<TextureHandle> {
+    let id = egui::Id::unique(("dragon_skin_art", name));
+    if let Some(t) = ctx.data(|d| d.get_temp::<TextureHandle>(id)) {
+        return Some(t);
+    }
+    let mut table = slots().lock().ok()?;
+    match table.get(name) {
+        None => {
+            table.insert(name.to_owned(), Slot::Loading);
+            let (ctx, name) = (ctx.clone(), name.to_owned());
+            std::thread::spawn(move || {
+                let image = find(&name).and_then(|(bytes, svg)| {
+                    let image = decode(&bytes, svg, SVG_PX);
+                    if image.is_none() {
+                        log::warn!("skin picture {name}: unreadable");
+                    }
+                    image
+                });
+                if let Ok(mut slots) = slots().lock() {
+                    slots.insert(name, Slot::Ready(image.map(Arc::new)));
+                }
+                ctx.request_repaint();
+            });
+            None
+        }
+        Some(Slot::Loading) | Some(Slot::Ready(None)) => None,
+        Some(Slot::Ready(Some(image))) => {
+            let t = ctx.load_texture(format!("dragon-skin-{name}"), (**image).clone(), TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+            Some(t)
+        }
+    }
+}
+
+fn full_uv() -> Rect {
+    Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0))
+}
+
+/// Draws `t` fitted inside `rect` (aspect kept, centred).
+pub fn paint_contain(painter: &Painter, t: &TextureHandle, rect: Rect, tint: Color32) -> Rect {
+    let [w, h] = t.size();
+    let scale = (rect.width() / w as f32).min(rect.height() / h as f32);
+    let r = Rect::from_center_size(rect.center(), vec2(w as f32 * scale, h as f32 * scale));
+    painter.image(t.id(), r, full_uv(), tint);
+    r
+}
+
+/// Draws the picture `name` fitted in `rect`; false when the skin has none.
+pub fn paint(painter: &Painter, name: &str, rect: Rect, tint: Color32) -> bool {
+    match texture(painter.ctx(), name) {
+        Some(t) => {
+            paint_contain(painter, &t, rect, tint);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Draws the picture `name` stretched over `rect`; false when there is none.
+pub fn paint_fill(painter: &Painter, name: &str, rect: Rect, tint: Color32) -> bool {
+    match texture(painter.ctx(), name) {
+        Some(t) => {
+            painter.image(t.id(), rect, full_uv(), tint);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A slider's knob: the skin's `slider-thumb` picture, else an orb.
+pub fn knob(painter: &Painter, center: Pos2, radius: f32) {
+    knob_colored(painter, center, radius, 0);
+}
+
+/// The slider colours of PG Viewer, in the mockup's order down a page:
+/// three pink, three blue, one green, again and again.
+pub fn next_slider_color(ctx: &Context) -> u8 {
+    let id = egui::Id::new("pg_slider_color_count");
+    let pass = ctx.cumulative_pass_nr();
+    let n = ctx.data_mut(|d| {
+        let (seen, n) = d.get_temp::<(u64, u32)>(id).unwrap_or((pass, 0));
+        let n = if seen == pass { n } else { 0 };
+        d.insert_temp(id, (pass, n + 1));
+        n
+    });
+    [0, 0, 0, 1, 1, 1, 2][n as usize % 7]
+}
+
+/// The fill colours (light, deep) of the slider colour `color`.
+pub fn slider_colors(color: u8) -> (Color32, Color32) {
+    match color {
+        1 => (Color32::from_rgb(160, 226, 255), Color32::from_rgb(30, 140, 255)),
+        2 => (Color32::from_rgb(200, 250, 150), Color32::from_rgb(70, 190, 40)),
+        _ => (Color32::from_rgb(255, 196, 232), Color32::from_rgb(240, 40, 160)),
+    }
+}
+
+/// A slider's knob of the colour `color` (0 pink, 1 blue, 2 green): the
+/// skin's `slider-thumb`, `slider-thumb-blue` or `slider-thumb-green`.
+pub fn knob_colored(painter: &Painter, center: Pos2, radius: f32, color: u8) {
+    let name = match color {
+        1 => "slider-thumb-blue",
+        2 => "slider-thumb-green",
+        _ => "slider-thumb",
+    };
+    if let Some(t) = texture(painter.ctx(), name).or_else(|| texture(painter.ctx(), "slider-thumb")) {
+        paint_contain(painter, &t, Rect::from_center_size(center, Vec2::splat(radius * 2.3)), Color32::WHITE);
+        return;
+    }
+    orb(painter, center, radius, 4);
+}
+
+/// A glowing orb, `index` 1 to 7: the skin's `balls/ball-<index>` picture,
+/// else a plain gold orb.
+pub fn orb(painter: &Painter, center: Pos2, radius: f32, index: u8) {
+    let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
+    // the skin's own orbs, at its top level or in `balls/`
+    let index = index.clamp(1, 7);
+    if paint(painter, &format!("ball-{index}"), rect, Color32::WHITE) || paint(painter, &format!("balls/ball-{index}"), rect, Color32::WHITE) {
+        return;
+    }
+    // drawn orb: deep orange rim to a pale gold core, a white highlight
+    let steps = 14;
+    for i in 0..steps {
+        let t = i as f32 / (steps - 1) as f32;
+        let r = radius * (1.0 - t * 0.92);
+        let c = Color32::from_rgb(200, 37, 102).lerp_to_gamma(Color32::from_rgb(255, 236, 140), t.powf(1.4));
+        let off = vec2(-0.26, -0.3) * radius * t;
+        painter.circle_filled(center + off, r, c);
+    }
+    painter.circle_stroke(center, radius, Stroke::new((radius * 0.06).max(1.0), Color32::from_rgb(130, 46, 0)));
+    painter.circle_filled(
+        center + vec2(-0.3, -0.42) * radius,
+        radius * 0.2,
+        Color32::from_rgba_unmultiplied(255, 255, 240, 150),
+    );
+}
+
+/// A soft round glow (additive-looking halo) of `color` around `center`.
+pub fn glow(painter: &Painter, center: Pos2, radius: f32, color: Color32, strength: f32) {
+    let rings = 10;
+    for i in 0..rings {
+        let t = i as f32 / rings as f32;
+        let r = radius * (1.0 - t * 0.7);
+        painter.circle_filled(center, r, color.gamma_multiply(strength * 0.09 * (0.3 + t)));
+    }
+}
+
+/// The gold jewel face of a button (`button-gold`, or `button-red` for a
+/// red one): the skin's picture stretched to the rect, else a drawn bevel.
+pub fn jewel(painter: &Painter, rect: Rect, red: bool, hot: bool, pressed: bool) {
+    let name = if red { "button-red" } else { "button-gold" };
+    let tint = if pressed {
+        Color32::from_gray(220)
+    } else if hot {
+        Color32::WHITE
+    } else {
+        Color32::from_gray(240)
+    };
+    if hot && !pressed {
+        // under the pointer: a warm glow behind the jewel, nothing over its face
+        glow(painter, rect.center(), rect.width() * 0.5, if red { Color32::from_rgb(255, 27, 143) } else { Color32::from_rgb(255, 67, 137) }, 0.7);
+    }
+    if paint_fill(painter, name, rect, tint) {
+        return;
+    }
+    drawn_jewel(painter, rect, red, hot, pressed);
+}
+
+/// The drawn jewel button: a dark outer rim, a bright metal rim, a glossy
+/// gradient face and a highlight across its top.
+pub fn drawn_jewel(painter: &Painter, rect: Rect, red: bool, hot: bool, pressed: bool) {
+    let radius = rect.height() * 0.32;
+    let (top, mid, bottom, rim, dark) = if red {
+        (
+            Color32::from_rgb(255, 120, 96),
+            Color32::from_rgb(214, 30, 18),
+            Color32::from_rgb(130, 8, 4),
+            Color32::from_rgb(255, 196, 160),
+            Color32::from_rgb(70, 4, 0),
+        )
+    } else {
+        (
+            Color32::from_rgb(255, 246, 170),
+            Color32::from_rgb(255, 160, 20),
+            Color32::from_rgb(200, 36, 102),
+            Color32::from_rgb(255, 240, 180),
+            Color32::from_rgb(110, 44, 0),
+        )
+    };
+    let lift = if pressed { 0.85 } else if hot { 1.12 } else { 1.0 };
+    let shade = |c: Color32| {
+        Color32::from_rgb(
+            (c.r() as f32 * lift).min(255.0) as u8,
+            (c.g() as f32 * lift).min(255.0) as u8,
+            (c.b() as f32 * lift).min(255.0) as u8,
+        )
+    };
+    if hot && !pressed {
+        let c = if red { Color32::from_rgb(255, 27, 143) } else { Color32::from_rgb(255, 67, 137) };
+        painter.rect_stroke(rect.expand(3.0), radius + 3.0, Stroke::new(5.0, c.gamma_multiply(0.3)), StrokeKind::Outside);
+    }
+    painter.rect_filled(rect, radius, dark);
+    let face = rect.shrink(2.5);
+    let upper = Rect::from_min_max(face.min, pos2(face.right(), face.center().y));
+    let lower = Rect::from_min_max(pos2(face.left(), face.center().y), face.max);
+    super::widgets::gradient_rect(painter, face, radius - 2.0, shade(top), shade(bottom));
+    super::widgets::gradient_rect(painter, upper, radius - 2.0, shade(top), shade(mid));
+    super::widgets::gradient_rect(painter, lower, 0.0, shade(mid), shade(bottom));
+    painter.rect_stroke(face, radius - 2.0, Stroke::new(1.6, rim), StrokeKind::Inside);
+    let shine = Rect::from_min_max(
+        face.min + vec2(radius * 0.6, 2.5),
+        pos2(face.right() - radius * 0.6, face.top() + face.height() * 0.38),
+    );
+    if shine.is_positive() {
+        super::widgets::gradient_rect(
+            painter,
+            shine,
+            shine.height() * 0.5,
+            Color32::from_white_alpha(120),
+            Color32::from_white_alpha(8),
+        );
+    }
+}
+
+/// Bold italic text with a dark outline and a soft shadow (the jewel
+/// buttons' labels and the window titles).
+pub fn outlined_text(painter: &Painter, center: Pos2, text: &str, size: f32, color: Color32, outline: Color32) -> Rect {
+    let family = super::fonts::display_bold(painter.ctx());
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::new(size, family.clone()), color);
+    job.sections[0].format.italics = family == egui::FontFamily::Proportional;
+    let galley = painter.layout_job(job);
+    let pos = center - galley.size() * 0.5;
+    let w = (size * 0.06).max(1.0);
+    for (dx, dy) in [(-w, 0.0), (w, 0.0), (0.0, -w), (0.0, w), (-w, -w), (w, w), (-w, w), (w, -w), (0.0, w * 2.0)] {
+        painter.galley_with_override_text_color(pos + vec2(dx, dy), galley.clone(), outline);
+    }
+    painter.galley(pos, galley.clone(), color);
+    Rect::from_min_size(pos, galley.size())
+}
+
+/// PG Viewer's colours, left to right across a window's rim: hot pink,
+/// violet, sky blue and lime, like the mockup's neon edges.
+pub const RAINBOW: [Color32; 4] = [
+    Color32::from_rgb(255, 64, 190),
+    Color32::from_rgb(176, 92, 255),
+    Color32::from_rgb(64, 176, 255),
+    Color32::from_rgb(120, 232, 72),
+];
+
+/// The rainbow colour at `t` (0 at the left, 1 at the right).
+pub fn rainbow_at(t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0) * (RAINBOW.len() - 1) as f32;
+    let i = (t.floor() as usize).min(RAINBOW.len() - 2);
+    RAINBOW[i].lerp_to_gamma(RAINBOW[i + 1], t - i as f32)
+}
+
+/// The points around the rounded rect `rect` (corner radius `radius`).
+fn rounded_outline(rect: Rect, radius: f32) -> Vec<Pos2> {
+    let r = radius.clamp(0.0, rect.width().min(rect.height()) * 0.5);
+    let corners = [
+        (pos2(rect.right() - r, rect.top() + r), -90.0_f32),
+        (pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (pos2(rect.left() + r, rect.bottom() - r), 90.0),
+        (pos2(rect.left() + r, rect.top() + r), 180.0),
+    ];
+    let mut points = Vec::with_capacity(44);
+    for (c, start) in corners {
+        for k in 0..=10 {
+            let a = (start + k as f32 * 9.0).to_radians();
+            points.push(c + vec2(a.cos(), a.sin()) * r);
+        }
+    }
+    points
+}
+
+/// A rounded outline whose colour runs through the rainbow from left to
+/// right, `width` thick, faded by `alpha`.
+pub fn rainbow_outline(painter: &Painter, rect: Rect, radius: f32, width: f32, alpha: f32) {
+    let points = rounded_outline(rect, radius);
+    let w = rect.width().max(1.0);
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        let t = ((a.x + b.x) * 0.5 - rect.left()) / w;
+        painter.line_segment([a, b], Stroke::new(width, rainbow_at(t).gamma_multiply(alpha)));
+    }
+}
+
+/// The rim of PG Viewer's glass panels: a soft neon glow outside and a
+/// bright rainbow edge, pink on the left to lime on the right.
+pub fn gold_rim(painter: &Painter, rect: Rect, radius: f32) {
+    rainbow_outline(painter, rect.expand(3.0), radius + 3.0, 6.0, 0.18);
+    painter.rect_stroke(rect, radius, Stroke::new(3.0, Color32::from_rgb(20, 10, 48)), StrokeKind::Outside);
+    rainbow_outline(painter, rect.shrink(1.0), (radius - 1.0).max(0.0), 2.2, 1.0);
+    painter.rect_stroke(
+        rect.shrink(2.6),
+        (radius - 2.6).max(0.0),
+        Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
+        StrokeKind::Inside,
+    );
+}
+
+/// The bytes of the skin file at `path` (with its extension), from the
+/// same places as the pictures.
+pub fn file_bytes(path: &str) -> Option<Vec<u8>> {
+    for dir in runtime_dirs() {
+        if let Ok(bytes) = std::fs::read(dir.join(path)) {
+            return Some(bytes);
+        }
+    }
+    embedded::SKIN_FILES.iter().find(|(n, _)| *n == path).map(|(_, b)| b.to_vec())
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct ToolbarLayout {
+    face_cap_px: f32,
+    orbs: HashMap<String, u8>,
+    /// Short English names for the skinned buttons ("Move", "Camera").
+    labels: HashMap<String, String>,
+}
+
+fn toolbar_layout() -> &'static ToolbarLayout {
+    static LAYOUT: OnceLock<ToolbarLayout> = OnceLock::new();
+    LAYOUT.get_or_init(|| {
+        file_bytes("toolbar/layout.json")
+            .and_then(|b| serde_json::from_slice(&b).map_err(|e| log::warn!("skin toolbar/layout.json: {e}")).ok())
+            .unwrap_or_default()
+    })
+}
+
+/// The orb (1 to 7) of a toolbar command, from `toolbar/layout.json`.
+pub fn toolbar_orb(command: &str) -> u8 {
+    toolbar_layout().orbs.get(command).copied().unwrap_or(4).clamp(1, 7)
+}
+
+/// The skin's toolbar button face (`toolbar/face`, `toolbar/face-active`)
+/// drawn over `rect` in three slices, its rounded ends unstretched. False
+/// when the skin has no face.
+pub fn toolbar_face(painter: &Painter, rect: Rect, active: bool, hot: bool) -> bool {
+    let name = if active { "toolbar/face-active" } else { "toolbar/face" };
+    let Some(t) = texture(painter.ctx(), name).or_else(|| texture(painter.ctx(), "toolbar/face")) else {
+        return false;
+    };
+    let [w, h] = t.size();
+    let (w, h) = (w as f32, h as f32);
+    let cap_px = if toolbar_layout().face_cap_px > 0.0 { toolbar_layout().face_cap_px } else { h * 0.47 };
+    let scale = rect.height() / h;
+    let cap = (cap_px * scale).min(rect.width() * 0.5);
+    let u = cap_px / w;
+    let tint = if hot && !active { Color32::from_gray(255) } else if active { Color32::WHITE } else { Color32::from_gray(235) };
+    let pieces = [
+        (Rect::from_min_max(rect.min, pos2(rect.left() + cap, rect.bottom())), Rect::from_min_max(pos2(0.0, 0.0), pos2(u, 1.0))),
+        (
+            Rect::from_min_max(pos2(rect.left() + cap, rect.top()), pos2(rect.right() - cap, rect.bottom())),
+            Rect::from_min_max(pos2(u, 0.0), pos2(1.0 - u, 1.0)),
+        ),
+        (Rect::from_min_max(pos2(rect.right() - cap, rect.top()), rect.max), Rect::from_min_max(pos2(1.0 - u, 0.0), pos2(1.0, 1.0))),
+    ];
+    for (r, uv) in pieces {
+        if r.width() > 0.0 {
+            painter.image(t.id(), r, uv, tint);
+        }
+    }
+    if hot {
+        painter.rect_filled(rect.shrink2(vec2(cap * 0.5, rect.height() * 0.2)), rect.height() * 0.3, Color32::from_white_alpha(14));
+    }
+    true
+}
+
+/// The skin picture `name` stretched over `rect` in three slices: its
+/// ends (as wide as the picture is high, scaled to the rect's height) kept,
+/// its middle stretched. False when the skin has none.
+pub fn three_slice(painter: &Painter, name: &str, rect: Rect, tint: Color32) -> bool {
+    let Some(t) = texture(painter.ctx(), name) else {
+        return false;
+    };
+    let [w, h] = t.size();
+    let (w, h) = (w as f32, h as f32);
+    let cap_px = (h * 0.5).min(w * 0.5);
+    let cap = (cap_px * rect.height() / h).min(rect.width() * 0.5);
+    let u = cap_px / w;
+    for (r, uv) in [
+        (Rect::from_min_max(rect.min, pos2(rect.left() + cap, rect.bottom())), Rect::from_min_max(pos2(0.0, 0.0), pos2(u, 1.0))),
+        (
+            Rect::from_min_max(pos2(rect.left() + cap, rect.top()), pos2(rect.right() - cap, rect.bottom())),
+            Rect::from_min_max(pos2(u, 0.0), pos2(1.0 - u, 1.0)),
+        ),
+        (Rect::from_min_max(pos2(rect.right() - cap, rect.top()), rect.max), Rect::from_min_max(pos2(1.0 - u, 0.0), pos2(1.0, 1.0))),
+    ] {
+        if r.width() > 0.0 {
+            painter.image(t.id(), r, uv, tint);
+        }
+    }
+    true
+}
+
+/// The skin's short name for a toolbar command, if it gives one.
+pub fn toolbar_label(command: &str) -> Option<&'static str> {
+    toolbar_layout().labels.get(command).map(String::as_str)
+}
+
+/// The title bar's wordmark: "PG" in hot pink and "VIEWER" in sky blue,
+/// heavy italic over a dark edge, with a pink glow behind.
+pub fn wordmark(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let family = super::fonts::display_bold(ui.ctx());
+    let italic = family == egui::FontFamily::Proportional;
+    let lay = |text: &str, color: Color32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::new(size, family.clone()), color);
+        job.sections[0].format.italics = italic;
+        ui.painter().layout_job(job)
+    };
+    let first = lay("PG", Color32::WHITE);
+    let second = lay(" VIEWER", Color32::WHITE);
+    let w = first.size().x + second.size().x + 6.0;
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, first.size().y.max(size + 4.0)), egui::Sense::hover());
+    let painter = ui.painter();
+    glow(painter, rect.center(), w * 0.45, Color32::from_rgb(255, 64, 190), 0.5);
+    let left = pos2(rect.left() + 3.0 + first.size().x * 0.5, rect.center().y);
+    outlined_text(painter, left, "PG", size, Color32::from_rgb(255, 92, 196), Color32::from_rgb(40, 0, 40));
+    let right = pos2(rect.left() + 3.0 + first.size().x + second.size().x * 0.5, rect.center().y);
+    outlined_text(painter, right, " VIEWER", size, Color32::from_rgb(130, 214, 255), Color32::from_rgb(20, 10, 60));
+    resp
+}
+
+/// An animated picture from the skin (`<name>.gif`): its frames as
+/// textures and each frame's time on screen. A green-screen background is
+/// keyed out, so a clip filmed or rendered on green shows only its subject.
+pub struct Animation {
+    pub frames: Vec<TextureHandle>,
+    /// seconds each frame stays up
+    pub delays: Vec<f32>,
+    pub size: Vec2,
+}
+
+impl Animation {
+    pub fn total(&self) -> f32 {
+        self.delays.iter().sum::<f32>().max(0.01)
+    }
+
+    /// The frame showing `t` seconds into the loop.
+    pub fn frame_at(&self, t: f32) -> &TextureHandle {
+        let mut left = t.rem_euclid(self.total());
+        for (i, d) in self.delays.iter().enumerate() {
+            if left < *d {
+                return &self.frames[i];
+            }
+            left -= d;
+        }
+        &self.frames[self.frames.len() - 1]
+    }
+}
+
+/// Makes green-screen pixels see-through, softens the edge and takes the
+/// green tint off the subject's outline.
+fn key_green(img: &mut image::RgbaImage) {
+    for px in img.pixels_mut() {
+        let [r, g, b, a] = px.0;
+        let (rf, gf, bf) = (r as f32, g as f32, b as f32);
+        let other = rf.max(bf);
+        let excess = gf - other;
+        if excess > 18.0 && gf > 60.0 {
+            // 18..70 of excess green fades from solid to clear
+            let keep = (1.0 - (excess - 18.0) / 52.0).clamp(0.0, 1.0);
+            let alpha = (a as f32 * keep) as u8;
+            // spill: pull the green down to the brighter of red and blue
+            px.0 = [r, other.min(gf) as u8, b, alpha];
+        } else if excess > 0.0 {
+            px.0 = [r, other as u8, b, a];
+        }
+    }
+}
+
+/// The skin's animation called `name` (`<name>.gif`), decoded in the
+/// background; None until it is ready, or when the skin has none.
+pub fn animation(ctx: &Context, name: &str) -> Option<Arc<Animation>> {
+    enum A {
+        Loading,
+        Ready(Option<Arc<Animation>>),
+    }
+    static TABLE: OnceLock<Mutex<HashMap<String, A>>> = OnceLock::new();
+    let table = TABLE.get_or_init(Default::default);
+    let mut t = table.lock().ok()?;
+    match t.get(name) {
+        Some(A::Ready(a)) => return a.clone(),
+        Some(A::Loading) => return None,
+        None => {}
+    }
+    t.insert(name.to_owned(), A::Loading);
+    let (ctx, name) = (ctx.clone(), name.to_owned());
+    std::thread::spawn(move || {
+        let anim = decode_animation(&ctx, &name);
+        if anim.is_none() {
+            log::info!("skin: no animation {name}.gif");
+        }
+        if let Ok(mut t) = table.lock() {
+            t.insert(name, A::Ready(anim.map(Arc::new)));
+        }
+        ctx.request_repaint();
+    });
+    None
+}
+
+fn decode_animation(ctx: &Context, name: &str) -> Option<Animation> {
+    use image::AnimationDecoder;
+    // the named GIF, else any GIF at the skin's top level (whatever it is called)
+    let bytes = file_bytes(&format!("{name}.gif")).or_else(any_gif)?;
+    let decoder = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let mut frames = Vec::new();
+    let mut delays = Vec::new();
+    let mut size = Vec2::ZERO;
+    // a long clip is cut at 240 frames, and a big one scaled to 360 px tall,
+    // to keep its memory small
+    for (i, frame) in decoder.into_frames().take(240).enumerate() {
+        let frame = frame.ok()?;
+        let (num, den) = frame.delay().numer_denom_ms();
+        let ms = if den == 0 { 0.0 } else { num as f32 / den as f32 };
+        let mut img = frame.into_buffer();
+        if img.height() > 360 {
+            let w = (img.width() as f32 * 360.0 / img.height() as f32).round().max(1.0) as u32;
+            img = image::imageops::resize(&img, w, 360, image::imageops::FilterType::Triangle);
+        }
+        key_green(&mut img);
+        size = vec2(img.width() as f32, img.height() as f32);
+        let color = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+        frames.push(ctx.load_texture(format!("dragon_anim_{name}_{i}"), color, TextureOptions::LINEAR));
+        delays.push(if ms < 20.0 { 0.066 } else { ms / 1000.0 });
+    }
+    (!frames.is_empty()).then_some(Animation { frames, delays, size })
+}
+
+/// The first GIF at the top of the skin folder, beside the exe or embedded.
+fn any_gif() -> Option<Vec<u8>> {
+    for dir in runtime_dirs() {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut gifs: Vec<_> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("gif")))
+                .collect();
+            gifs.sort();
+            if let Some(bytes) = gifs.first().and_then(|p| std::fs::read(p).ok()) {
+                return Some(bytes);
+            }
+        }
+    }
+    embedded::SKIN_FILES
+        .iter()
+        .find(|(n, _)| !n.contains('/') && n.to_ascii_lowercase().ends_with(".gif"))
+        .map(|(_, b)| b.to_vec())
+}
+
+/// PG Viewer's mouse pointer: where the interface shows the plain arrow,
+/// the skin's `cursor` picture (its tip at the top left) is painted at the
+/// pointer, above every window, and the system arrow is hidden. Text,
+/// resize, grab and other pointers stay the system's.
+pub fn heart_cursor(ctx: &Context) {
+    if ctx.output(|o| o.cursor_icon) != egui::CursorIcon::Default {
+        return;
+    }
+    let Some(at) = ctx.input(|i| i.pointer.latest_pos()) else {
+        return;
+    };
+    if !ctx.input(|i| i.pointer.has_pointer()) {
+        return;
+    }
+    let Some(t) = texture(ctx, "cursor") else {
+        return;
+    };
+    ctx.set_cursor_icon(egui::CursorIcon::None);
+    let size = 26.0;
+    let rect = Rect::from_min_size(at - vec2(2.0, 2.0), Vec2::splat(size));
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::new("pg_heart_cursor")));
+    painter.image(t.id(), rect, full_uv(), Color32::WHITE);
+}

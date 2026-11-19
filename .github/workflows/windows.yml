@@ -1,0 +1,107 @@
+name: Windows release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release version (vMAJOR.MINOR.PATCH)
+        type: string
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      PG_BUILD_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check PowerShell scripts
+        shell: powershell
+        run: ./scripts/check-scripts.ps1
+      - name: Install NSIS if needed
+        shell: pwsh
+        run: |
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            if (-not (Test-Path (Join-Path $nsis 'makensis.exe'))) {
+              choco install nsis -y --no-progress
+              if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed.' }
+            }
+            $nsis >> $env:GITHUB_PATH
+          }
+      # the skin's own app icon (skin/app-icon.png): the exe's, the
+      # installer's and the window's icon, made from it
+      - name: Use the skin's app icon
+        shell: pwsh
+        run: |
+          # skin/app-icon.ico or .png, else the one .ico (and its .png) in skin/
+          $ico = @(Get-ChildItem skin -File -Filter 'app-icon.ico') + @(Get-ChildItem skin -File -Filter '*.ico') | Select-Object -First 1
+          $png = if (Test-Path skin/app-icon.png) { Get-Item skin/app-icon.png } elseif ($ico) { Get-Item ([IO.Path]::ChangeExtension($ico.FullName, '.png')) -ErrorAction SilentlyContinue }
+          if ($ico) {
+            Copy-Item $ico.FullName assets/branding/pg-viewer.ico -Force
+            "App icon taken from $($ico.Name)"
+          }
+          if ($png) {
+            Copy-Item $png.FullName skin/app-icon.png -Force
+          }
+          if ((Test-Path skin/app-icon.png) -and -not $ico) {
+            python -m pip install --quiet pillow
+            python -c "from PIL import Image; im = Image.open('skin/app-icon.png').convert('RGBA'); im.thumbnail((256, 256)); c = Image.new('RGBA', (256, 256)); c.paste(im, ((256 - im.width) // 2, (256 - im.height) // 2)); c.save('assets/branding/pg-viewer.ico', sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]); c.save('assets/branding/pg-viewer-icon.png')"
+            if ($LASTEXITCODE -ne 0) { throw 'App icon conversion failed.' }
+            'App icon taken from skin/app-icon.png'
+          } elseif (Test-Path skin/app-icon.png) {
+            python -m pip install --quiet pillow
+            python -c "from PIL import Image; im = Image.open('skin/app-icon.png').convert('RGBA'); im.thumbnail((256, 256)); im.save('assets/branding/pg-viewer-icon.png')"
+          }
+      - name: Build and verify Windows x64 package
+        shell: pwsh
+        run: ./scripts/build-release.ps1 -Tag $env:PG_BUILD_TAG -Out target/pg-windows-release
+      - name: Upload installer and portable package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PG-Viewer-${{ inputs.tag }}-windows-x64
+          path: target/pg-windows-release/
+          if-no-files-found: error
+          compression-level: 0
+      - name: Publish the release (installer and portable zip)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem target/pg-windows-release -File | ForEach-Object FullName
+          gh release view $env:PG_BUILD_TAG -R $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:PG_BUILD_TAG @files --clobber -R $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:PG_BUILD_TAG @files --target $env:GITHUB_SHA --title "PG Viewer $($env:PG_BUILD_TAG.Substring(1))" --notes "PG Viewer for Windows: run PG-Viewer-Setup to install." -R $env:GITHUB_REPOSITORY
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed ($LASTEXITCODE)" }
+      - name: Capture login and Preferences screenshots
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem target/pg-windows-release -Recurse -Filter 'PG-Viewer-*-windows-x64.zip' | Select-Object -First 1
+          $tmp = Join-Path $env:RUNNER_TEMP 'moon-portable'
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $tmp -Force
+          $exe = Get-ChildItem $tmp -Recurse -Filter 'pg-viewer.exe' | Select-Object -First 1
+          $shots = New-Item -ItemType Directory -Force -Path target/ds-screenshots
+          foreach ($scene in 'Login', 'Preferences') {
+            try { ./scripts/capture-moon.ps1 -Exe $exe.FullName -Out $shots.FullName -Scene $scene }
+            catch { Write-Warning $_ }
+          }
+      - name: Upload screenshots
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: PG-Viewer-screenshots
+          path: target/ds-screenshots/
+          if-no-files-found: warn
