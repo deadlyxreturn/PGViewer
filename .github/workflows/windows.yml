@@ -48,7 +48,7 @@ jobs:
             Copy-Item $ico.FullName assets/branding/pg-viewer.ico -Force
             "App icon taken from $($ico.Name)"
           }
-          if ($png) {
+          if ($png -and ($png.Name -ne 'app-icon.png' -or $png.DirectoryName -ne (Resolve-Path skin).Path)) {
             Copy-Item $png.FullName skin/app-icon.png -Force
           }
           if ((Test-Path skin/app-icon.png) -and -not $ico) {
