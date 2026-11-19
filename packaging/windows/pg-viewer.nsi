@@ -24,7 +24,7 @@ VIAddVersionKey "FileDescription" "PG Viewer installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "PG Viewer contributors. See NOTICE.md. GPLv3 or later."
 
-!define MUI_ICON "..\..\assets\branding\pg-viewer.ico"
+!define MUI_ICON "..\..\assets\branding\pg-viewer-installer.ico"
 !define MUI_UNICON "..\..\assets\branding\pg-viewer.ico"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Install PG Viewer ${VERSION}"
